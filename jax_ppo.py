@@ -447,51 +447,62 @@ def make_trajectory_postprocess(num_steps: int, num_envs: int, gamma: float,
 # ── Deterministic eval episode (D40) ────────────────────────────────────────
 
 
-def make_eval_fn():
-    """Jitted deterministic episode from index 0; frozen norm stats; raw rewards.
+def _eval_fn_impl(params, norm: NormState, env_params: EnvParams):
+    """Deterministic episode from index 0; frozen norm stats; raw rewards.
 
-    Returns per-step reward and equity plus up-to-two trade records per step —
-    enough for ``_ConsistencyEvalCallback``'s (reward, max_dd_pct, n_trades).
+    Returns per-step reward, equity and account state plus up-to-two trade
+    records per step — enough for ``_ConsistencyEvalCallback``'s
+    (reward, max_dd_pct, n_trades) and for ``rollout_on_split``'s frames.
     ``env_params`` is an argument (D34).
     """
+    length = env_params.close.shape[0] - 2
+    state = jax_env.init_state(env_params, 0)
+    obs_raw = jax_env.observation(state, env_params)[None, :]
+    obs_norm = normalize_obs(obs_raw, norm)
 
-    def eval_fn(params, norm: NormState, env_params: EnvParams):
-        length = env_params.close.shape[0] - 2
-        state = jax_env.init_state(env_params, 0)
-        obs_raw = jax_env.observation(state, env_params)[None, :]
-        obs_norm = normalize_obs(obs_raw, norm)
+    def body(carry, _):
+        state, obs_norm = carry
+        action = deterministic_actions(policy_logits(params, obs_norm))[0]
+        hist_close = env_params.close[state.i]
+        hist_ts = env_params.decision_ts[state.i]
+        obs_next, state, rew, term, trunc, info = jax_env.step(state, action, env_params)
+        done = term | trunc
+        obs_next = jnp.where(done, jnp.zeros_like(obs_next), obs_next)
+        obs_next_norm = normalize_obs(obs_next[None, :], norm)
+        return (state, obs_next_norm), {
+            "reward": rew,
+            "equity": info.equity,
+            "realized": info.realized,
+            "direction": info.direction,
+            "close": hist_close,
+            "time_ns": hist_ts,
+            "closed": info.closed,
+            "reason": info.reason,
+            "trade_direction": info.trade_direction,
+            "entry_ts": info.entry_ts,
+            "exit_ts": info.exit_ts,
+            "entry_price": info.entry_price,
+            "exit_price": info.exit_price,
+            "sl": info.sl,
+            "tp": info.tp,
+            "sl_atr_mult": info.sl_atr_mult,
+            "tp_r": info.tp_r,
+            "units": info.units,
+            "pnl": info.pnl,
+            "r_mult": info.r_mult,
+            "bars_in_trade": info.bars_in_trade,
+        }
 
-        def body(carry, _):
-            state, obs_norm = carry
-            action = deterministic_actions(policy_logits(params, obs_norm))[0]
-            obs_next, state, rew, term, trunc, info = jax_env.step(state, action, env_params)
-            done = term | trunc
-            obs_next = jnp.where(done, jnp.zeros_like(obs_next), obs_next)
-            obs_next_norm = normalize_obs(obs_next[None, :], norm)
-            return (state, obs_next_norm), {
-                "reward": rew,
-                "equity": info.equity,
-                "closed": info.closed,
-                "reason": info.reason,
-                "trade_direction": info.trade_direction,
-                "entry_ts": info.entry_ts,
-                "exit_ts": info.exit_ts,
-                "entry_price": info.entry_price,
-                "exit_price": info.exit_price,
-                "sl": info.sl,
-                "tp": info.tp,
-                "sl_atr_mult": info.sl_atr_mult,
-                "tp_r": info.tp_r,
-                "units": info.units,
-                "pnl": info.pnl,
-                "r_mult": info.r_mult,
-                "bars_in_trade": info.bars_in_trade,
-            }
+    _carry, out = jax.lax.scan(body, (state, obs_norm), None, length=length)
+    return out
 
-        _carry, out = jax.lax.scan(body, (state, obs_norm), None, length=length)
-        return out
 
-    return jax.jit(eval_fn)
+eval_fn = jax.jit(_eval_fn_impl)
+
+
+def make_eval_fn():
+    """Singleton jitted eval (shape-keyed cache; never rebuild per call)."""
+    return eval_fn
 
 
 # ── Checkpoint IO (D42) ─────────────────────────────────────────────────────
@@ -541,6 +552,140 @@ def load_checkpoint(path: Path | str) -> tuple[dict, NormState]:
     return params, NormState(**norm_arrays)
 
 
+# ── B4: uniform model handle + split rollout (driver/loader integration) ────
+
+
+class JaxModel(NamedTuple):
+    """Loader handle: a checkpointed policy + its norm stats.
+
+    Consumed by the same call sites as an SB3 ``PPO`` object via the framework
+    branches in ``train_ppo._load_fold_model`` / ``train_ppo._rollout_on_split``
+    and the loader branches in ``final_holdout_eval.py`` /
+    ``training_diagnostics.py`` (SCALING_PLAN.md B4).
+    """
+    params: dict
+    norm: NormState
+
+
+def load_model(path: Path | str) -> JaxModel:
+    params, norm = load_checkpoint(path)
+    return JaxModel(params=params, norm=norm)
+
+
+def slice_m1_for_decision_window(m1: pd.DataFrame, decision_df: pd.DataFrame) -> pd.DataFrame:
+    """Local copy of ``train_ppo._slice_m1_for_decision_window`` (avoids a
+    circular import; the rule must stay in sync with that function)."""
+    if decision_df.empty:
+        return m1.iloc[0:0].copy()
+    start, end = decision_df.index.min(), decision_df.index.max()
+    return m1.loc[(m1.index > start) & (m1.index <= end)].copy()
+
+
+def build_env_params_cfg(decision_df, m1_sl, feature_cols, episode_steps=None) -> EnvParams:
+    """``build_env_params`` with ``config.CFG`` trade economics — bit-compatible
+    with ``train_ppo.build_env``'s kwargs."""
+    from config import CFG
+    return jax_env.build_env_params(
+        decision_df, m1_sl, feature_cols,
+        sl_atr_multipliers=CFG.sl_atr_multipliers,
+        tp_r_multipliers=CFG.tp_r_multipliers,
+        initial_equity=CFG.initial_equity,
+        risk_fraction=CFG.risk_fraction,
+        spread_price=CFG.spread_price,
+        slippage_price=CFG.slippage_price,
+        commission_per_trade=CFG.commission_per_trade,
+        holding_penalty=CFG.holding_penalty,
+        reward_mtm_weight=CFG.reward_mtm_weight,
+        max_episode_steps=episode_steps,
+    )
+
+
+def rollout_on_split(handle: JaxModel, m1: pd.DataFrame, feature_cols: list[str],
+                     decision_df: pd.DataFrame):
+    """Deterministic rollout over one decision split — JAX twin of
+    ``train_ppo._rollout_on_split``.
+
+    Returns ``(equity_df, trades_df, report_dict)`` with the exact schemas of
+    ``BracketTradingEnv.equity_curve()`` / ``trade_log()`` so every downstream
+    consumer (evaluate.py, stitching, CSVs) is reused unchanged.
+    """
+    from evaluate import full_report
+    from config import CFG
+
+    m1_sl = slice_m1_for_decision_window(m1, decision_df)
+    env_params = build_env_params_cfg(decision_df, m1_sl, feature_cols, episode_steps=None)
+    out = make_eval_fn()(handle.params, handle.norm, env_params)
+
+    idx = pd.Index(
+        jax_env.stamps_from_ts(np.asarray(out["time_ns"]), decision_df.index), name="time")
+    eq = pd.DataFrame({
+        "equity": np.asarray(out["equity"], dtype=np.float64),
+        "realized_pnl": np.asarray(out["realized"], dtype=np.float64),
+        "position": np.asarray(out["direction"], dtype=np.int8),
+        "close": np.asarray(out["close"], dtype=np.float64),
+        "reward": np.asarray(out["reward"], dtype=np.float64),
+    }, index=idx)
+
+    tz = decision_df.index.tz
+    rows = []
+    closed = np.asarray(out["closed"])
+    for t in range(closed.shape[1]):
+        for slot in (0, 1):
+            if bool(closed[slot, t]):
+                rows.append({
+                    "entry_time": jax_env.stamps_from_ts([int(out["entry_ts"][slot, t])], decision_df.index)[0],
+                    "exit_time": jax_env.stamps_from_ts([int(out["exit_ts"][slot, t])], decision_df.index)[0],
+                    "direction": int(out["trade_direction"][slot, t]),
+                    "entry_price": float(out["entry_price"][slot, t]),
+                    "exit_price": float(out["exit_price"][slot, t]),
+                    "sl": float(out["sl"][slot, t]),
+                    "tp": float(out["tp"][slot, t]),
+                    "sl_atr_mult": float(out["sl_atr_mult"][slot, t]),
+                    "tp_r_bracket": float(out["tp_r"][slot, t]),
+                    "units": float(out["units"][slot, t]),
+                    "pnl": float(out["pnl"][slot, t]),
+                    "r_mult": float(out["r_mult"][slot, t]),
+                    "bars_in_trade": int(out["bars_in_trade"][slot, t]),
+                    "exit_reason": jax_env.REASON_STRINGS[int(out["reason"][slot, t])],
+                })
+    trades = pd.DataFrame(rows, columns=[
+        "entry_time", "exit_time", "direction", "entry_price", "exit_price",
+        "sl", "tp", "sl_atr_mult", "tp_r_bracket", "units", "pnl", "r_mult",
+        "bars_in_trade", "exit_reason",
+    ])
+    rep = full_report(eq, trades, initial_equity=CFG.initial_equity,
+                      periods_per_year=CFG.periods_per_year)["value"].to_dict()
+    return eq, trades, rep
+
+
+def post_training_eval_jax(handle: JaxModel, m1: pd.DataFrame, feature_cols: list[str],
+                           splits: dict, out_dir: Path | str, slug: str) -> Path:
+    """JAX twin of ``train_ppo._post_training_eval`` (A6): chained in-sample →
+    out-of-sample equity chart from deterministic rollouts."""
+    from visualize import plot_insample_oos_equity, save_html
+    from config import CFG
+
+    equities: dict = {}
+    for name, decision_df in splits.items():
+        if decision_df is None or decision_df.empty:
+            continue
+        eq, trades, _rep = rollout_on_split(handle, m1, feature_cols, decision_df)
+        equities[name] = eq
+        final = float(eq["equity"].iloc[-1]) if len(eq) else CFG.initial_equity
+        ret = (final / CFG.initial_equity - 1) * 100
+        print(f"  {name:<6}  trades={len(trades):>4}  "
+              f"final=${final:>9,.0f}  return={ret:+.1f}%")
+
+    fig = plot_insample_oos_equity(
+        equities, initial_equity=CFG.initial_equity,
+        title=f"Equity — in-sample vs out-of-sample  [{slug}]",
+    )
+    out_path = Path(out_dir) / f"{slug}_equity_insample_oos.html"
+    save_html(fig, out_path)
+    print(f"\nEquity chart → {out_path}")
+    return out_path
+
+
 # ── Trainer driver ──────────────────────────────────────────────────────────
 
 
@@ -555,13 +700,19 @@ def train_jax(
     num_envs: int | None = None,
     num_steps: int | None = None,
     num_minibatches: int | None = None,
+    post_eval_chart: bool = False,
+    reveal_test: bool = False,
+    learning_rate: float | None = None,
+    ent_coef: float | None = None,
+    clip_range: float | None = None,
     log_fn=print,
 ):
     """One training run over a train/val split — the B3 entry point.
 
     Hyperparameters come from ``config.CFG`` (D36 mapping); geometry defaults
     to ``CFG.jax_num_envs × CFG.jax_num_steps`` with the SB3-parity preset
-    available by overriding.  B4 will call this per fold.
+    available by overriding.  B4 calls this per fold (``datasets`` tuple);
+    the hp overrides exist for the B5 swarm sweeps.
     """
     from config import CFG
     import train_ppo as tp
@@ -571,21 +722,21 @@ def train_jax(
     num_minibatches = (CFG.jax_num_minibatches if num_minibatches is None
                        else num_minibatches)
     gamma, gae_lambda = 0.99, 0.95
-    clip_range = CFG.ppo_clip_range
-    ent_coef = CFG.ppo_ent_coef
+    clip_range = CFG.ppo_clip_range if clip_range is None else clip_range
+    ent_coef = CFG.ppo_ent_coef if ent_coef is None else ent_coef
     vf_coef = 0.5
     target_kl = CFG.ppo_target_kl
     weight_decay = CFG.ppo_weight_decay
     n_epochs = CFG.ppo_n_epochs
-    lr0 = CFG.ppo_learning_rate
+    lr0 = CFG.ppo_learning_rate if learning_rate is None else learning_rate
 
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
     if datasets is None:
-        m1, feature_cols, train_feat, val_feat, _test = tp.load_datasets()
+        m1, feature_cols, train_feat, val_feat, test_feat = tp.load_datasets()
     else:
-        m1, feature_cols, train_feat, val_feat, _test = datasets
+        m1, feature_cols, train_feat, val_feat, test_feat = datasets
     train_m1 = tp._slice_m1_for_decision_window(m1, train_feat)
     val_m1 = tp._slice_m1_for_decision_window(m1, val_feat)
     train_eval_feat = train_feat.iloc[-len(val_feat):]
@@ -594,19 +745,7 @@ def train_jax(
     obs_dim = len(feature_cols) + 6
 
     def build(df, m1_sl, episode_steps):
-        return jax_env.build_env_params(
-            df, m1_sl, feature_cols,
-            sl_atr_multipliers=CFG.sl_atr_multipliers,
-            tp_r_multipliers=CFG.tp_r_multipliers,
-            initial_equity=CFG.initial_equity,
-            risk_fraction=CFG.risk_fraction,
-            spread_price=CFG.spread_price,
-            slippage_price=CFG.slippage_price,
-            commission_per_trade=CFG.commission_per_trade,
-            holding_penalty=CFG.holding_penalty,
-            reward_mtm_weight=CFG.reward_mtm_weight,
-            max_episode_steps=episode_steps,
-        )
+        return build_env_params_cfg(df, m1_sl, feature_cols, episode_steps)
 
     env_train = build(train_feat, train_m1, train_episode_steps)
     env_train_eval = build(train_eval_feat, train_eval_m1, None)
@@ -636,7 +775,6 @@ def train_jax(
     post_fn = make_trajectory_postprocess(num_steps, num_envs, gamma, gae_lambda)
     update_fn = make_update_fn(num_minibatches, n_epochs, clip_range, ent_coef,
                                vf_coef, target_kl, weight_decay)
-    eval_fn = make_eval_fn()
 
     buffer = num_envs * num_steps
     num_updates = max(int(np.ceil(total_timesteps / buffer)), 1)
@@ -728,5 +866,15 @@ def train_jax(
         run_info["best_model_path"] = str(best)
         run_info["best_model_vecnorm_path"] = str(out_path / "best_model" / "best_model_norm.npz")
     (out_path / "run_info.json").write_text(json.dumps(run_info, indent=2))
+
+    if post_eval_chart:
+        handle = JaxModel(params=state.params, norm=state.norm)
+        splits = {"Train": train_feat, "Val": val_feat}
+        if reveal_test:
+            splits["Test"] = test_feat
+        else:
+            log_fn("[jax] post-training chart: test split remains sealed")
+        post_training_eval_jax(handle, m1, feature_cols, splits, out_path, slug)
+
     log_fn(f"[jax] done in {time.time() - t0:.0f}s -> {out_path / 'run_info.json'}")
     return state, eval_rows

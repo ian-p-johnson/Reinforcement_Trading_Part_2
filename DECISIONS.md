@@ -277,3 +277,36 @@ change of mind gets a new numbered row, never a silent edit.
 validation & swarms. The trainer entry point is `jax_ppo.train_jax(...)` (accepts the
 same `datasets` tuple as `train_ppo.train`) and writes the ARTIFACTS layout with
 `"framework": "jax"` for the future loader branches.
+
+---
+
+# DECISIONS.md — Track B4/B5 decision log (driver integration & swarms)
+
+## B4. Walk-forward driver integration
+
+| # | Decision | Rationale |
+|---|---|---|
+| D51 | **Engine routing replaces only the inner `train()` call.** `train_sliding_walk_forward(engine="sb3"|"jax")` → `_run_sliding_fold(engine=...)` branches at the training call; the post-train tail (checkpoint load, val/test rollouts, `fold_result.json`/`test_equity.csv`/`test_trades.csv`, summary, stitching, gate, promotion/NO_DEPLOY) is shared code. Loader branches: `jax_ppo.JaxModel` handle returned by the framework-aware `_load_fold_model`, recognised by `_rollout_on_split`/`_run_split` (training_diagnostics) and by `final_holdout_eval._run_rl_holdout_jax`; `_promote_fold_to_production` is engine-aware for artifact names (npz pair vs zip/pkl). CLI: `python train_ppo.py --engine jax`. | Plan B4: "keep everything unchanged in Python… replace only the inner `train()` call… add a loader branch for the JAX checkpoint rather than rewriting those scripts." One shared tail guarantees the gate/stitching semantics cannot drift between engines. |
+| D52 | **Parallel JAX fold workers set `XLA_PYTHON_CLIENT_PREALLOCATE=false` + `XLA_PYTHON_CLIENT_ALLOCATOR=platform`** before any jax import; `engine` travels in `fold_spec.json`. Sequential mode verified first, then the parallel driver (2 workers) — both green in `tests/test_jax_driver.py`. | Plan B4 leaves this open ("decide during B4"): N jitted trainers each preallocating 75% VRAM cannot coexist; allocate-on-demand lets workers share the 12 GB card (per-worker working set is small: fold pads ~30–100 MB + nets). |
+| D53 | **B5-L1 seed sweeps run sequential in-process** (`swarm.run_seed_sweep`), not concurrent — deviation from the plan's "N concurrent single-seed trains" wording. | On a single GPU, concurrent trainers time-share the same device anyway; sequential gives deterministic wall-clock attribution, trivial VRAM use, and no XLA allocator contention. Concurrency stays available via the fold-worker pattern if a multi-GPU box appears. |
+| D54 | **B5-L3 is wrapper-style population hyperparameter search** (evosax 0.3.2 `SimpleGA`/`Open_ES`/`PGPE`/`CMA_ES` over (lr, ent_coef, clip_range), fitness = short-train + deterministic val `q`), **not weight-space ES/PBT**. | The plan offers "population/PBT over PPO hyperparameters **or policy weights**". Hyperparameter-level PBT is the robust, immediately useful half and reuses evosax ask/tell cleanly; weight-space evolution of a PPO policy needs a different fitness protocol (lengthy evals, nonstationarity) — recorded as open (B5 continuation). |
+| D55 | **evosax multi-device sharding is not exercised** (single-GPU box). | Plan calls it "a one-liner"; no hardware to validate on — recorded rather than claimed. |
+| D56 | **B5-L2 batched window scoring uses padded batches + per-window length masks** (`swarm.make_window_batch`): windows differ in both T and window-width W; both axes are padded (high −inf / low +inf / win_len 0 / zeros elsewhere), inactive steps freeze the state and zero the outputs. Verified exactly equal to the per-window loop. | "All test windows scored in one jitted call" needs uniform shapes; the inert-padding + mask design keeps semantics identical to the single-window eval (asserted in `test_batched_gate_eval_matches_loop`). |
+
+## B5. Throughput validation — implementation status
+
+| Item | Status | Evidence |
+|---|---|---|
+| Benchmark harness | implemented, **timings NOT yet run** | `jax_benchmarks.py`: `env` (vmap step @ 1k/4k/16k/64k envs), `train` (end-to-end steps/s @ CFG geometry), `comp` (compile time per shape), `xfer` (trajectory MB + pull cost), `vram` (residency/peak). JIT hygiene per plan: `clear_caches()` between experiments, static shapes, values as args (D34). |
+| Harness wiring test | done (quick sizes only) | `tests/test_jax_swarm.py::test_benchmark_harness_wires` — asserts every group records output; **numbers at `--quick` sizes are never quotable**. |
+| Swarm L1 (seeds) | done | `swarm.run_seed_sweep` + smoke test (2 seeds, synthetic) |
+| Swarm L2 (batched gate evals) | done | `swarm.batched_gate_eval`, exact-match test vs per-window loop |
+| Swarm L3 (population hp sweeps) | done (experimental) | `swarm.run_evosax_sweep`, evosax 0.3.2 API verified (`init/ask/tell`); smoke test pop 3 × 2 gens |
+| **Recorded throughput numbers** | **PENDING — paused for a quiet machine** | To run: `python jax_benchmarks.py all --data real` (+ the B5 full-sweep wall-clock with `python train_ppo.py --engine jax` at production budget). Per the user's instruction, timing-sensitive runs are scheduled, not improvised. |
+
+**B4 evidence:** `tests/test_jax_driver.py` — real-data toy-budget sliding runs into isolated
+out_dirs: sequential JAX driver, parallel JAX driver (2 workers), and SB3↔JAX **schema parity**
+(summary columns, fold_result keys, CSV columns identical; metrics legitimately differ across
+trainers — D48). Loader branches exercised via the shared `_rollout_on_split` tail.
+
+| D57 | **Eval-path `PPO.load(...)` calls go to CPU** (`_load_fold_model`, `final_holdout_eval._run_rl_holdout`, `training_diagnostics`), training device selection is unchanged. | SB3's `PPO.load` defaults to auto-device (CUDA if present). In shared-process runs JAX holds VRAM and torch's cuBLAS fails to initialise (`CUBLAS_STATUS_NOT_INITIALIZED`, seen in the combined suite). Single-env deterministic evals gain nothing from the GPU anyway (ANALYSIS §4.3: per-step transfer cost dominates). |

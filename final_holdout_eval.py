@@ -55,7 +55,7 @@ def _run_rl_holdout(
     venv.training = False
     venv.norm_reward = False
 
-    model = PPO.load(str(model_path), env=venv)
+    model = PPO.load(str(model_path), env=venv, device="cpu")  # eval-path CPU (D57)
     obs = venv.reset()
     done = [False]
     while not done[0]:
@@ -74,6 +74,24 @@ def _run_rl_holdout(
     return equity, trades, report
 
 
+def _run_rl_holdout_jax(
+    decision_df: pd.DataFrame,
+    m1_df: pd.DataFrame,
+    feature_cols: list[str],
+    run_info: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Loader branch for JAX checkpoints (B4, DECISIONS.md D51/D52): same
+    outputs as ``_run_rl_holdout`` via the jitted deterministic rollout."""
+    from jax_ppo import load_model, rollout_on_split
+
+    model_path = run_info.get("best_model_path", run_info["model_path"])
+    print(f"Using JAX checkpoint: {model_path}")
+    handle = load_model(model_path)
+    equity, trades, rep = rollout_on_split(handle, m1_df, feature_cols, decision_df)
+    report = pd.DataFrame.from_dict(rep, orient="index", columns=["value"])
+    return equity, trades, report
+
+
 def main(out_dir: str = "outputs/final_holdout") -> None:
     print("Revealing the sealed test split and writing holdout-only artifacts.")
 
@@ -81,31 +99,37 @@ def main(out_dir: str = "outputs/final_holdout") -> None:
     out_path.mkdir(parents=True, exist_ok=True)
 
     _, run_info = load_run_info("models")
-    model_path = resolve_sb3_model_path(run_info["model_path"], ".")
-    vecnorm_path = resolve_project_path(run_info["vecnorm_path"], ".")
-    best_model_path = Path("models/best_model/best_model.zip")
-    if best_model_path.exists():
-        print(f"Using best validation checkpoint: {best_model_path}")
-        model_path = best_model_path
-        # Pair the best checkpoint with the normalisation it was selected under,
-        # when train_walk_forward saved a snapshot alongside it.
-        if "best_model_vecnorm_path" in run_info:
-            vecnorm_path = resolve_project_path(run_info["best_model_vecnorm_path"], ".")
-        elif Path("models/best_model/best_model_vecnorm.pkl").exists():
-            vecnorm_path = Path("models/best_model/best_model_vecnorm.pkl")
-    else:
-        print(f"Using final checkpoint from run_info.json: {model_path}")
-
     m1, feature_cols, _train_feat, _val_feat, test_feat = load_datasets()
     test_m1 = _slice_m1_for_decision_window(m1, test_feat)
 
-    rl_eq, rl_trades, rl_report = _run_rl_holdout(
-        test_feat,
-        test_m1,
-        feature_cols,
-        model_path=model_path,
-        vecnorm_path=vecnorm_path,
-    )
+    if run_info.get("framework") == "jax":
+        # Loader branch (B4): JAX checkpoints carry params+norm in npz files;
+        # everything downstream is identical.
+        rl_eq, rl_trades, rl_report = _run_rl_holdout_jax(
+            test_feat, m1, feature_cols, run_info)
+    else:
+        model_path = resolve_sb3_model_path(run_info["model_path"], ".")
+        vecnorm_path = resolve_project_path(run_info["vecnorm_path"], ".")
+        best_model_path = Path("models/best_model/best_model.zip")
+        if best_model_path.exists():
+            print(f"Using best validation checkpoint: {best_model_path}")
+            model_path = best_model_path
+            # Pair the best checkpoint with the normalisation it was selected under,
+            # when train_walk_forward saved a snapshot alongside it.
+            if "best_model_vecnorm_path" in run_info:
+                vecnorm_path = resolve_project_path(run_info["best_model_vecnorm_path"], ".")
+            elif Path("models/best_model/best_model_vecnorm.pkl").exists():
+                vecnorm_path = Path("models/best_model/best_model_vecnorm.pkl")
+        else:
+            print(f"Using final checkpoint from run_info.json: {model_path}")
+
+        rl_eq, rl_trades, rl_report = _run_rl_holdout(
+            test_feat,
+            test_m1,
+            feature_cols,
+            model_path=model_path,
+            vecnorm_path=vecnorm_path,
+        )
     rl_eq.to_csv(out_path / "rl_test_equity_curve.csv")
     rl_trades.to_csv(out_path / "rl_test_trade_log.csv", index=False)
 

@@ -25,3 +25,4 @@ jaxlib==0.12.0.1
 jax-cuda13-plugin==0.12.0.1
 jax-cuda13-pjrt==0.12.0.1
 optax==0.2.8
+evosax==0.3.2        # B5 swarm level 3 (population hp sweeps)

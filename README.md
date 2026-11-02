@@ -89,7 +89,9 @@ notebooks/XAUUSD_RL_Pipeline_Demo.ipynb
 - `visualize.py`: Plotly visualization functions.
 - `train_ppo.py`: optional PPO training scaffold. `python train_ppo.py` runs the sliding walk-forward (folds run in parallel subprocess workers by default — see `CFG.default_n_parallel_folds`).
 - `jax_env.py`: JAX port of the bracket environment (Track B2) — functional `reset`/`step` pytrees, parity-tested against `env_bracket.py` (see `tests/test_jax_env_parity.py`).
-- `jax_ppo.py`: JAX PPO trainer (Track B3) — `train_jax(...)` mirrors `train_ppo.train`'s semantics; design/deviations in `DECISIONS.md` D22–D50.
+- `jax_ppo.py`: JAX PPO trainer (Track B3) — `train_jax(...)` mirrors `train_ppo.train`'s semantics; design/deviations in `DECISIONS.md` (Track B decision log).
+- `jax_benchmarks.py`: JAX throughput suite (Track B5: env/train steps/s, compile, transfer, VRAM). Run timings only on a quiet machine; `--quick` is harness sanity, not quotable.
+- `swarm.py`: Track B5 swarm layer — multi-seed sweeps (`seeds`), batched multi-window gate evals (`gate-eval`), evosax population hp sweeps (`evosax`).
 - `run_pipeline.py`: one-command pre-test pipeline with validation-only outputs.
 - `final_holdout_eval.py`: explicit one-time holdout evaluation entry point.
 - `benchmarks.py`: runnable perf suite (env/vec-env/learn/data timings) for before/after comparisons.

@@ -87,7 +87,14 @@ _METRICS_OF_INTEREST = [
 
 
 def _run_split(model, decision_df, m1_df, feature_cols, vecnorm_path):
-    """Evaluate a loaded PPO model on one split and return the report dict."""
+    """Evaluate a loaded model on one split and return the report dict."""
+    if type(model).__name__ == "JaxModel":
+        # Loader branch (B4, D51): JAX checkpoints roll out via the jitted
+        # deterministic eval with identical report semantics.
+        from jax_ppo import rollout_on_split
+        _eq, _trades, rep = rollout_on_split(model, m1_df, feature_cols, decision_df)
+        return rep
+
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
     from train_ppo import _CaptureDoneWrapper, build_env
     from evaluate import full_report
@@ -346,6 +353,7 @@ def run_diagnostics(models_dir: str = "models", reveal_test: bool = False) -> No
 
     model_path: Path | None = None
     vecnorm_path = models_path / "vec_normalize.pkl"
+    run_info: dict = {}
     try:
         _, run_info = load_run_info(models_path)
         # Prefer the best (eligible) checkpoint + its normalisation snapshot so
@@ -373,15 +381,22 @@ def run_diagnostics(models_dir: str = "models", reveal_test: bool = False) -> No
 
     print(f"  Loading model: {model_path}")
     try:
-        from stable_baselines3 import PPO
-        from stable_baselines3.common.vec_env import VecNormalize
-
-        if vecnorm_path.exists():
-            print(f"  VecNormalize stats: {vecnorm_path}")
+        if run_info.get("framework") == "jax":
+            # Loader branch (B4, D51): params + norm stats live in the npz
+            # checkpoint pair; _run_split routes to the jitted rollout.
+            from jax_ppo import load_model
+            model = load_model(model_path)
+            print(f"  JAX checkpoint (params+norm): {model_path}")
         else:
-            print("  ⚠ vec_normalize.pkl not found — evaluation will use unnormalized obs.")
+            from stable_baselines3 import PPO
+            from stable_baselines3.common.vec_env import VecNormalize
 
-        model = PPO.load(str(model_path))
+            if vecnorm_path.exists():
+                print(f"  VecNormalize stats: {vecnorm_path}")
+            else:
+                print("  ⚠ vec_normalize.pkl not found — evaluation will use unnormalized obs.")
+
+            model = PPO.load(str(model_path), device="cpu")  # eval-path CPU (D57)
 
         def _m1_slice(df):
             return m1.loc[(m1.index > df.index.min()) & (m1.index <= df.index.max())]

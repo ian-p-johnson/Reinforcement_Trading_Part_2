@@ -627,8 +627,13 @@ def _rollout_on_split(model, vecnorm_path, m1, feature_cols, decision_df):
 
     Returns (equity_df, trades_df, report_dict).  VecNormalize stats are loaded
     from disk and frozen (training=False, norm_reward=False) so evaluation never
-    updates them."""
+    updates them.  Engine-aware (B4, D51): a ``jax_ppo.JaxModel`` handle routes
+    to the jitted JAX rollout with identical output schemas."""
     from evaluate import full_report
+
+    if type(model).__name__ == "JaxModel":
+        from jax_ppo import rollout_on_split
+        return rollout_on_split(model, m1, feature_cols, decision_df)
 
     m1_sl = _slice_m1_for_decision_window(m1, decision_df)
 
@@ -718,9 +723,18 @@ def _promote_fold_to_production(out_dir: str, fold_k: int, subdir: str = "walk_f
     dst = Path(out_dir)
     _, fr = load_run_info(src)
     slug = fr["slug"]
+    # Engine-aware artifact names (B4, D51): JAX checkpoints are npz pairs,
+    # SB3 checkpoints are zip + vecnorm pkl.  The best_model directory copy and
+    # the eval_logs mirror are engine-agnostic.
+    is_jax = fr.get("framework") == "jax"
+    if is_jax:
+        names = (f"{slug}.npz", f"{slug}_norm.npz", f"{slug}_equity_insample_oos.html")
+        best_name, best_norm_name = "best_model.npz", "best_model_norm.npz"
+    else:
+        names = (f"{slug}.zip", f"{slug}_vecnorm.pkl", f"{slug}_equity_insample_oos.html")
+        best_name, best_norm_name = "best_model.zip", "best_model_vecnorm.pkl"
 
-    for name in (f"{slug}.zip", f"{slug}_vecnorm.pkl",
-                 f"{slug}_equity_insample_oos.html"):
+    for name in names:
         s = src / name
         if s.exists():
             shutil.copy2(s, dst / name)
@@ -735,10 +749,14 @@ def _promote_fold_to_production(out_dir: str, fold_k: int, subdir: str = "walk_f
         shutil.copy2(src_log, dst / "eval_logs" / "consistency_evals.csv")
 
     prod = dict(fr)
-    prod["model_path"] = str(dst / f"{slug}.zip")
-    prod["vecnorm_path"] = str(dst / f"{slug}_vecnorm.pkl")
-    bm = dst / "best_model" / "best_model.zip"
-    bmv = dst / "best_model" / "best_model_vecnorm.pkl"
+    if is_jax:
+        prod["model_path"] = str(dst / f"{slug}.npz")
+        prod["vecnorm_path"] = str(dst / f"{slug}_norm.npz")
+    else:
+        prod["model_path"] = str(dst / f"{slug}.zip")
+        prod["vecnorm_path"] = str(dst / f"{slug}_vecnorm.pkl")
+    bm = dst / "best_model" / best_name
+    bmv = dst / "best_model" / best_norm_name
     if bm.exists():
         prod["best_model_path"] = str(bm)
         if bmv.exists():
@@ -911,14 +929,28 @@ def train_walk_forward(
 
 def _load_fold_model(fold_dir: str):
     """Load a fold's deployable model + its vecnorm path, preferring the best
-    (eligible) checkpoint and its normalisation snapshot when present."""
+    (eligible) checkpoint and its normalisation snapshot when present.
+
+    Engine-aware (B4, DECISIONS.md D51): JAX checkpoints (``framework: "jax"``
+    in run_info) come back as a ``jax_ppo.JaxModel`` handle that the shared
+    rollout/eval paths accept transparently.
+    """
     from stable_baselines3 import PPO
     _, ri = load_run_info(fold_dir)
+    if ri.get("framework") == "jax":
+        from jax_ppo import load_model
+        key = "best_model_path" if "best_model_path" in ri else "model_path"
+        vp_key = ("best_model_vecnorm_path" if "best_model_vecnorm_path" in ri
+                  else "vecnorm_path")
+        return load_model(ri[key]), Path(ri[vp_key])
+    # Eval-path loads go to CPU (D57): single-env deterministic rollouts gain
+    # nothing from the GPU (ANALYSIS §4.3) and PPO.load's auto-device would
+    # otherwise contend with JAX for VRAM in shared-process runs.
     if "best_model_path" in ri and Path(ri["best_model_path"]).exists():
-        model = PPO.load(ri["best_model_path"])
+        model = PPO.load(ri["best_model_path"], device="cpu")
         vp = ri.get("best_model_vecnorm_path", ri["vecnorm_path"])
     else:
-        model = PPO.load(ri["model_path"])
+        model = PPO.load(ri["model_path"], device="cpu")
         vp = ri["vecnorm_path"]
     return model, Path(vp)
 
@@ -940,6 +972,7 @@ def _run_sliding_fold(
     device: str,
     eval_freq: int,
     post_eval_chart: bool = True,
+    engine: str = "sb3",
 ):
     """Train + evaluate exactly one sliding fold.
 
@@ -947,23 +980,43 @@ def _run_sliding_fold(
     the parent needs (``fold_result.json``, ``test_equity.csv``,
     ``test_trades.csv``) inside the fold directory so parallel workers can run
     this function in their own process (Track A4, DECISIONS.md D13/D14).
+
+    ``engine`` (B4, D51): "sb3" trains via ``train()``; "jax" trains via
+    ``jax_ppo.train_jax`` on the same datasets.  Everything after the train
+    call — checkpoint load, val/test rollouts, fold artifacts — is shared.
     """
     fold_dir = Path(out_dir) / "sliding" / f"fold_{k}"
     fold_dir.mkdir(parents=True, exist_ok=True)
 
-    train(
-        total_timesteps=total_timesteps,
-        seed=seed,
-        out_dir=str(fold_dir),
-        train_episode_steps=train_episode_steps,
-        eval_freq=eval_freq,
-        dd_penalty=dd_penalty,
-        n_envs=n_envs,
-        device=device,
-        reveal_test=False,
-        post_eval_chart=post_eval_chart,
-        datasets=(m1, feature_cols, tr, va, te),
-    )
+    if engine == "jax":
+        # Geometry comes from CFG.jax_* (D36); n_envs/device are SB3 knobs and
+        # do not apply to the jitted trainer.
+        import jax_ppo
+        jax_ppo.train_jax(
+            total_timesteps=total_timesteps,
+            seed=seed,
+            out_dir=str(fold_dir),
+            train_episode_steps=train_episode_steps,
+            eval_freq=eval_freq,
+            dd_penalty=dd_penalty,
+            datasets=(m1, feature_cols, tr, va, te),
+            post_eval_chart=post_eval_chart,
+            log_fn=print,
+        )
+    else:
+        train(
+            total_timesteps=total_timesteps,
+            seed=seed,
+            out_dir=str(fold_dir),
+            train_episode_steps=train_episode_steps,
+            eval_freq=eval_freq,
+            dd_penalty=dd_penalty,
+            n_envs=n_envs,
+            device=device,
+            reveal_test=False,
+            post_eval_chart=post_eval_chart,
+            datasets=(m1, feature_cols, tr, va, te),
+        )
 
     # Evaluate the deployable (best) checkpoint on val (reference) and on the
     # untouched TEST window (the honest out-of-sample result).
@@ -1003,6 +1056,12 @@ def _fold_worker_main(spec_path: str) -> int:
     spec = json.loads(Path(spec_path).read_text())
     k = int(spec["fold"])
     out_dir = spec.get("out_dir", "models")
+    engine = spec.get("engine", "sb3")
+    if engine == "jax":
+        # Multiple JAX workers must share the GPU: allocate on demand instead
+        # of each preallocating 75% of VRAM (B4, DECISIONS.md D52).
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+        os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 
     m1, feat, feature_cols = _load_decision_features()
     folds = make_sliding_folds(
@@ -1029,6 +1088,7 @@ def _fold_worker_main(spec_path: str) -> int:
         device=spec.get("device", "auto"),
         eval_freq=eval_freq,
         post_eval_chart=bool(spec.get("post_eval_chart", False)),
+        engine=engine,
     )
     print(f"\nfold {k} complete: test_return={row['test_return_pct']}")
     return 0
@@ -1118,6 +1178,7 @@ def train_sliding_walk_forward(
     n_envs: int | None = None,
     device: str | None = None,
     n_parallel_folds: int | None = None,
+    engine: str = "sb3",
 ):
     """Sliding-window walk-forward that simulates periodic retraining.
 
@@ -1167,7 +1228,8 @@ def train_sliding_walk_forward(
     print("=" * 72)
     print(f"  SLIDING WALK-FORWARD — {n_folds} folds  "
           f"(train {CFG.sliding_train_years:g}y → val {CFG.sliding_val_months}m → "
-          f"test {CFG.sliding_test_months}m, slide {CFG.sliding_step_months}m)")
+          f"test {CFG.sliding_test_months}m, slide {CFG.sliding_step_months}m)"
+          f"  [engine={engine}]")
     print(f"  {total_timesteps:,} steps/fold × {n_folds} folds = "
           f"~{total_timesteps * n_folds:,} env-steps total. envs={n_envs}"
           + (f", parallel folds={n_parallel_folds}" if n_parallel_folds > 1 else ""))
@@ -1185,6 +1247,7 @@ def train_sliding_walk_forward(
             train_episode_steps=train_episode_steps,
             target_evals_per_fold=target_evals_per_fold,
             dd_penalty=dd_penalty, n_envs=n_envs, device=device,
+            engine=engine,
             # Charts are diagnostic-only; the production fold is re-plotted by
             # _finalize_deployment's artifacts and final_holdout_eval.py (A6).
             post_eval_chart=False,
@@ -1205,6 +1268,7 @@ def train_sliding_walk_forward(
                 train_episode_steps=train_episode_steps, dd_penalty=dd_penalty,
                 n_envs=n_envs, device=device, eval_freq=eval_freq_k,
                 post_eval_chart=(k == n_folds),
+                engine=engine,
             )
             row["_test_equity"] = test_eq
             row["_test_trades"] = test_trades
@@ -1293,4 +1357,7 @@ if __name__ == "__main__":
     # this process (spawned by train_sliding_walk_forward's parallel driver).
     if len(sys.argv) >= 3 and sys.argv[1] == "--fold-worker":
         raise SystemExit(_fold_worker_main(sys.argv[2]))
-    raise SystemExit(train_sliding_walk_forward() or 0)
+    _engine = "sb3"
+    if "--engine" in sys.argv:
+        _engine = sys.argv[sys.argv.index("--engine") + 1]
+    raise SystemExit(train_sliding_walk_forward(engine=_engine) or 0)

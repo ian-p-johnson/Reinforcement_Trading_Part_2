@@ -35,6 +35,12 @@ REASON_TP = 2
 REASON_MANUAL = 3
 REASON_FLIP = 4
 
+# Trade-log strings, matching env_bracket's exit_reason values exactly.
+REASON_STRINGS = {
+    REASON_NONE: "", REASON_SL: "SL", REASON_TP: "TP",
+    REASON_MANUAL: "manual_close", REASON_FLIP: "flip_close",
+}
+
 # Sanity bound on the padded window width (D30): H1 decisions over M1 execution cap
 # windows at 60 bars unless decision rows are dropped mid-series.  Loud failure >1024.
 MAX_WINDOW_WIDTH = 1024
