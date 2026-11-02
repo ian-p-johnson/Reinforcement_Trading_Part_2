@@ -46,3 +46,12 @@ The gate **only prevents** deployment (`NO_DEPLOY.txt`); the fold's best model i
    `scaled = equity / initial_equity * running`.
 3. `run_info.json` keys above are stable; new engines add keys, never remove/rename.
 4. The sealed test is byte-identical across split schemes (tested: `tests/test_splits.py`).
+
+## JAX engine artifacts (Track B3, DECISIONS.md D42/D44)
+
+`run_info.json` gains `"framework": "jax"` (loader-branch key). The checkpoint pair is
+`.npz`-based: `best_model/best_model.npz` (params + norm stats in ONE file — invariant 1
+by construction) with `best_model/best_model_norm.npz` as the standalone normalisation
+snapshot; final weights `<slug>.npz` + `<slug>_norm.npz`. `eval_logs/consistency_evals.csv`
+keeps the exact column schema above. Loader for the npz format:
+`jax_ppo.load_checkpoint(path) -> (params, NormState)`.

@@ -16,3 +16,12 @@ pytest==9.2.0       # tests/
 # Install the torch build matching your CUDA toolkit manually, e.g.
 #   pip install torch==2.15.0 --index-url https://download.pytorch.org/whl/cu126
 torch>=2.15.0,<3.0
+
+# Track B additions (DECISIONS.md B0/D45) — jax + optax for the JAX port.
+# cuda13 wheels match this machine's driver (590.48 / CUDA 13.1); on a CPU-only
+# box install just `jax`/`jaxlib` (B0 fallback ladder rung 5).
+jax==0.12.0.1
+jaxlib==0.12.0.1
+jax-cuda13-plugin==0.12.0.1
+jax-cuda13-pjrt==0.12.0.1
+optax==0.2.8

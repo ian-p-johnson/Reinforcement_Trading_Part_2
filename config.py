@@ -179,6 +179,20 @@ class ProjectConfig:
     ppo_weight_decay: float = 1e-5         # L2 on the policy/value net (Adam optimizer_kwargs)
     ppo_net_arch: Tuple[int, ...] = (128, 64)  # smaller net regularises the thin signal
 
+    # ── Track B3: JAX trainer geometry (DECISIONS.md D36) ─────────────────
+    # Hyperparameters above map 1:1 onto jax_ppo.py.  Geometry mapping of the
+    # SB3 reference run (n_steps=2048 x n_envs=4 = 8192 transitions/update,
+    # batch 256, 32 minibatches/epoch x 5 epochs = 160 grad steps/update):
+    # the JAX defaults trade rollout horizon for GPU batch width while keeping
+    # 32 minibatches/epoch and 160 grad steps/update — 64 envs x 256 steps =
+    # 16384 transitions/update (2x buffer), minibatch 512.  GAE horizon 256 vs
+    # 2048 is negligible at gamma*lambda=0.9405 (tail weight ~1e-7).
+    # SB3-parity preset (identical buffer + GAE horizon to the SB3 runs):
+    # num_envs=4, num_steps=2048, num_minibatches=32 -> minibatch 256.
+    jax_num_envs: int = 64
+    jax_num_steps: int = 256
+    jax_num_minibatches: int = 32
+
     # Baseline search space. Wider brackets reduce churn on noisy intraday gold.
     baseline_threshold_grid: Tuple[float, ...] = (0.3, 0.5, 0.7, 0.9)
     baseline_sl_idx_grid: Tuple[int, ...] = (1, 2)
