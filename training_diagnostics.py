@@ -288,8 +288,7 @@ def _feature_collinearity_flags(feat: pd.DataFrame, feature_cols: list[str],
 
 def run_diagnostics(models_dir: str = "models", reveal_test: bool = False) -> None:
     from config import CFG
-    from data_loader import load_mt_ohlcv_csv, resample_ohlcv, split_train_val_test
-    from features import prepare_feature_frame
+    from data_loader import split_train_val_test
 
     models_path = Path(models_dir)
     eval_log_dir = models_path / "eval_logs"
@@ -313,19 +312,8 @@ def run_diagnostics(models_dir: str = "models", reveal_test: bool = False) -> No
     print("\n[2] FEATURE QUALITY")
     print("-" * 50)
     print("  Loading data …")
-    m1 = load_mt_ohlcv_csv(
-        CFG.csv_path, time_col=CFG.time_col, source_tz=CFG.source_tz,
-        timestamp_is_bar_open=CFG.timestamp_is_bar_open,
-        bar_duration=CFG.pandas_execution_tf,
-        start_date=CFG.start_date, end_date=CFG.end_date,
-        max_days_for_demo=CFG.max_days_for_demo,
-    )
-    from data_loader import resample_ohlcv
-    decision = resample_ohlcv(m1, CFG.pandas_tf)
-    feat, feature_cols = prepare_feature_frame(
-        decision, warmup_bars=CFG.warmup_bars,
-        atr_period=CFG.atr_period, rsi_period=CFG.rsi_period,
-    )
+    from data_cache import load_all
+    m1, decision, feat, feature_cols = load_all()
     train_feat, val_feat, test_feat = split_train_val_test(
         feat, train_frac=CFG.train_frac, val_frac=CFG.val_frac,
         embargo_bars=CFG.split_embargo_bars,

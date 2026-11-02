@@ -36,8 +36,7 @@ from pathlib import Path
 import pandas as pd
 
 from config import CFG
-from data_loader import load_mt_ohlcv_csv, resample_ohlcv, split_train_val_test
-from features import prepare_feature_frame
+from data_loader import split_train_val_test
 from evaluate import full_report
 from visualize import (
     plot_candles_with_indicators,
@@ -56,24 +55,9 @@ _VIEW = Path("outputs/view")
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_features() -> tuple[pd.DataFrame, list[str]]:
-    """Reload M1, resample, compute features.  Takes ~5–15 s; no simulation."""
-    m1 = load_mt_ohlcv_csv(
-        CFG.csv_path,
-        time_col=CFG.time_col,
-        source_tz=CFG.source_tz,
-        timestamp_is_bar_open=CFG.timestamp_is_bar_open,
-        bar_duration=CFG.pandas_execution_tf,
-        start_date=CFG.start_date,
-        end_date=CFG.end_date,
-        max_days_for_demo=CFG.max_days_for_demo,
-    )
-    decision = resample_ohlcv(m1, CFG.pandas_tf)
-    feat, feature_cols = prepare_feature_frame(
-        decision,
-        warmup_bars=CFG.warmup_bars,
-        atr_period=CFG.atr_period,
-        rsi_period=CFG.rsi_period,
-    )
+    """Reload M1, resample, compute features (parquet-cached; ~1 s warm)."""
+    from data_cache import load_all
+    _m1, _decision, feat, feature_cols = load_all()
     return feat, feature_cols
 
 

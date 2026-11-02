@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from copy import deepcopy
@@ -15,14 +16,11 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from config import CFG
 from data_loader import (
-    load_mt_ohlcv_csv,
     make_sliding_folds,
     make_walk_forward_folds,
-    resample_ohlcv,
     split_train_val_test,
 )
 from evaluate import drawdown
-from features import prepare_feature_frame
 from env_bracket import BracketTradingEnv
 from model_artifacts import load_run_info
 
@@ -46,24 +44,14 @@ def _slice_m1_for_decision_window(m1_df, decision_df):
 def _load_decision_features():
     """Load M1, resample to the decision timeframe, build the causal feature
     frame.  Shared by load_datasets() (single split) and load_folds() (walk-
-    forward) so both modes see byte-identical bars and features."""
-    m1 = load_mt_ohlcv_csv(
-        CFG.csv_path,
-        time_col=CFG.time_col,
-        source_tz=CFG.source_tz,
-        timestamp_is_bar_open=CFG.timestamp_is_bar_open,
-        bar_duration=CFG.pandas_execution_tf,
-        start_date=CFG.start_date,
-        end_date=CFG.end_date,
-        max_days_for_demo=CFG.max_days_for_demo,
-    )
-    decision = resample_ohlcv(m1, CFG.pandas_tf)
-    feat, feature_cols = prepare_feature_frame(
-        decision,
-        warmup_bars=CFG.warmup_bars,
-        atr_period=CFG.atr_period,
-        rsi_period=CFG.rsi_period,
-    )
+    forward) so both modes see byte-identical bars and features.
+
+    Routed through data_cache (Track A5): the parsed M1 frame and the feature
+    frame are cached in parquet keyed by the source file and config, so repeat
+    runs skip the CSV parse entirely.
+    """
+    from data_cache import load_all
+    m1, _decision, feat, feature_cols = load_all()
     return m1, feat, feature_cols
 
 
@@ -327,12 +315,20 @@ def train(
     device: str = "auto",
     # ────────────────────────────────────────────────────────────────────────
     reveal_test: bool = False,
+    post_eval_chart: bool = True,   # A6: full-history rollout chart after training
     # Inject pre-built splits (used by train_walk_forward to train one fold).
     # When None, load the single chronological split via load_datasets().
     datasets: tuple | None = None,
 ):
     import torch
     from stable_baselines3 import PPO
+
+    # ── Thread cap (A2/D12) ─────────────────────────────────────────────────
+    # torch defaults to one thread per core; for PPO's tiny matmuls that is
+    # pathological (thread-launch overhead dominates), and it compounds badly
+    # when parallel fold workers each grab all cores.  Cap it explicitly.
+    torch.set_num_threads(max(1, int(CFG.torch_threads)))
+    os.environ.setdefault("OMP_NUM_THREADS", str(CFG.torch_threads))
 
     # ── Device selection ─────────────────────────────────────────────────────
     if device == "auto":
@@ -512,22 +508,26 @@ def train(
     print(f"Run info   → {info_path}")
 
     # ── Post-training equity chart: in-sample → out-of-sample ───────────────
-    print("\nRunning post-training evaluation (train / val / test) …")
-    if reveal_test:
-        print("\nRunning post-training evaluation (train / val / test) â€¦")
-        eval_splits = {"Train": train_feat, "Val": val_feat, "Test": test_feat}
+    # A6: skipped per-fold in the sliding sweep (the chart is diagnostic only);
+    # the production fold keeps it.
+    if post_eval_chart:
+        if reveal_test:
+            print("\nRunning post-training evaluation (train / val / test) …")
+            eval_splits = {"Train": train_feat, "Val": val_feat, "Test": test_feat}
+        else:
+            print("\nRunning post-training evaluation (train / val only; test remains sealed) …")
+            eval_splits = {"Train": train_feat, "Val": val_feat}
+        _post_training_eval(
+            model=model,
+            vecnorm_path=str(vecnorm_path),
+            m1=m1,
+            feature_cols=feature_cols,
+            splits=eval_splits,
+            out_dir=out_dir,
+            slug=slug,
+        )
     else:
-        print("\nRunning post-training evaluation (train / val only; test remains sealed) â€¦")
-        eval_splits = {"Train": train_feat, "Val": val_feat}
-    _post_training_eval(
-        model=model,
-        vecnorm_path=str(vecnorm_path),
-        m1=m1,
-        feature_cols=feature_cols,
-        splits=eval_splits,
-        out_dir=out_dir,
-        slug=slug,
-    )
+        print("\nPost-training equity chart skipped (post_eval_chart=False).")
     if not reveal_test:
         print("Test split remains sealed. Use final_holdout_eval.py when the model is frozen.")
     return model, train_env
@@ -834,7 +834,7 @@ def train_walk_forward(
               f"\n   budget {fold_ts:,} steps (~{passes:.0f} passes), eval every "
               f"{eval_freq_k:,}  → {fold_dir}")
 
-        model, _ = train(
+        train(
             total_timesteps=fold_ts,
             seed=seed,
             out_dir=fold_dir,
@@ -847,13 +847,10 @@ def train_walk_forward(
             datasets=(m1, feature_cols, tr, va, test_feat),
         )
 
-        # Re-evaluate the just-trained fold model on its own (OOS) val window,
-        # preferring the best (eligible) checkpoint + its normalisation snapshot.
-        _, run_info = load_run_info(fold_dir)
-        if "best_model_vecnorm_path" in run_info:
-            vecnorm_path = Path(fold_dir) / "best_model" / "best_model_vecnorm.pkl"
-        else:
-            vecnorm_path = Path(fold_dir) / Path(run_info["vecnorm_path"]).name
+        # Re-evaluate the fold on its OOS val window using the SAME checkpoint
+        # + normalisation pair we would deploy (A7/D19: previously this scored
+        # the final weights under the best checkpoint's VecNormalize).
+        model, vecnorm_path = _load_fold_model(fold_dir)
         rep = evaluate_on_split(model, vecnorm_path, m1, feature_cols, va)
         summary_rows.append({
             "fold": k,
@@ -926,6 +923,191 @@ def _load_fold_model(fold_dir: str):
     return model, Path(vp)
 
 
+def _run_sliding_fold(
+    k: int,
+    tr: pd.DataFrame,
+    va: pd.DataFrame,
+    te: pd.DataFrame,
+    m1: pd.DataFrame,
+    feature_cols: list,
+    *,
+    total_timesteps: int,
+    seed: int,
+    out_dir: str,
+    train_episode_steps: int,
+    dd_penalty: float,
+    n_envs: int,
+    device: str,
+    eval_freq: int,
+    post_eval_chart: bool = True,
+):
+    """Train + evaluate exactly one sliding fold.
+
+    Returns ``(summary_row, test_equity, test_trades)`` and persists everything
+    the parent needs (``fold_result.json``, ``test_equity.csv``,
+    ``test_trades.csv``) inside the fold directory so parallel workers can run
+    this function in their own process (Track A4, DECISIONS.md D13/D14).
+    """
+    fold_dir = Path(out_dir) / "sliding" / f"fold_{k}"
+    fold_dir.mkdir(parents=True, exist_ok=True)
+
+    train(
+        total_timesteps=total_timesteps,
+        seed=seed,
+        out_dir=str(fold_dir),
+        train_episode_steps=train_episode_steps,
+        eval_freq=eval_freq,
+        dd_penalty=dd_penalty,
+        n_envs=n_envs,
+        device=device,
+        reveal_test=False,
+        post_eval_chart=post_eval_chart,
+        datasets=(m1, feature_cols, tr, va, te),
+    )
+
+    # Evaluate the deployable (best) checkpoint on val (reference) and on the
+    # untouched TEST window (the honest out-of-sample result).
+    model, vp = _load_fold_model(str(fold_dir))
+    val_rep = evaluate_on_split(model, vp, m1, feature_cols, va)
+    test_eq, test_trades, test_rep = _rollout_on_split(model, vp, m1, feature_cols, te)
+
+    row = {
+        "fold": k,
+        "train_start": str(tr.index.min().date()), "train_end": str(tr.index.max().date()),
+        "test_start": str(te.index.min().date()), "test_end": str(te.index.max().date()),
+        "val_return_pct": val_rep.get("total_return_pct"),
+        "val_profit_factor": val_rep.get("profit_factor"),
+        "test_return_pct": test_rep.get("total_return_pct"),
+        "test_sharpe": test_rep.get("sharpe_like"),
+        "test_profit_factor": test_rep.get("profit_factor"),
+        "test_win_rate_pct": test_rep.get("win_rate_pct"),
+        "test_max_dd_pct": test_rep.get("max_drawdown_pct"),
+        "test_avg_r": test_rep.get("avg_r"),
+        "test_n_trades": test_rep.get("n_trades"),
+    }
+
+    # Persist artifacts for the orchestrator (parallel mode reads these back).
+    (fold_dir / "fold_result.json").write_text(json.dumps(row, default=str))
+    test_eq.to_csv(fold_dir / "test_equity.csv")
+    if test_trades is not None:
+        test_trades.to_csv(fold_dir / "test_trades.csv", index=False)
+    return row, test_eq, test_trades
+
+
+def _fold_worker_main(spec_path: str) -> int:
+    """Entry point for ``python train_ppo.py --fold-worker <spec.json>``.
+
+    Runs one sliding fold in its own process (own CUDA context) and exits;
+    the parent orchestrator collects ``fold_result.json`` afterwards.
+    """
+    spec = json.loads(Path(spec_path).read_text())
+    k = int(spec["fold"])
+    out_dir = spec.get("out_dir", "models")
+
+    m1, feat, feature_cols = _load_decision_features()
+    folds = make_sliding_folds(
+        feat,
+        train_years=CFG.sliding_train_years,
+        val_months=CFG.sliding_val_months,
+        test_months=CFG.sliding_test_months,
+        step_months=CFG.sliding_step_months,
+        embargo_bars=CFG.split_embargo_bars,
+    )
+    if not (1 <= k <= len(folds)):
+        raise ValueError(f"fold {k} out of range (have {len(folds)} sliding folds)")
+    tr, va, te = folds[k - 1]
+    eval_freq = max(25_000, int(spec["total_timesteps"]) // int(spec.get("target_evals_per_fold", 20)))
+
+    row, _eq, _trades = _run_sliding_fold(
+        k, tr, va, te, m1, feature_cols,
+        total_timesteps=int(spec["total_timesteps"]),
+        seed=int(spec.get("seed", 42)),
+        out_dir=out_dir,
+        train_episode_steps=int(spec.get("train_episode_steps", 2048)),
+        dd_penalty=float(spec.get("dd_penalty", 0.8)),
+        n_envs=int(spec.get("n_envs", 4)),
+        device=spec.get("device", "auto"),
+        eval_freq=eval_freq,
+        post_eval_chart=bool(spec.get("post_eval_chart", False)),
+    )
+    print(f"\nfold {k} complete: test_return={row['test_return_pct']}")
+    return 0
+
+
+def _run_folds_in_parallel(
+    folds, n_folds: int, n_parallel: int, out_dir: str, spec_common: dict,
+) -> list[dict]:
+    """Spawn subprocess workers (≤ n_parallel at a time) and collect results.
+
+    Each worker is ``python train_ppo.py --fold-worker <spec>`` with its stdout
+    redirected to ``<fold_dir>/worker.log`` so concurrent folds don't interleave
+    output.  A crashed worker is recorded as a failed fold row and the sweep
+    continues (DECISIONS.md D13).
+    """
+    import subprocess
+
+    summary_rows: list[dict] = []
+    pending = list(range(1, n_folds + 1))
+    running: dict = {}   # fold_k -> (process, spec_path)
+
+    def _launch(kk: int):
+        tr, va, te = folds[kk - 1]
+        fold_dir = Path(out_dir) / "sliding" / f"fold_{kk}"
+        fold_dir.mkdir(parents=True, exist_ok=True)
+        spec = dict(spec_common, fold=kk, out_dir=out_dir)
+        spec_path = fold_dir / "fold_spec.json"
+        spec_path.write_text(json.dumps(spec, default=str))
+        log_path = fold_dir / "worker.log"
+        log_f = open(log_path, "w")
+        proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--fold-worker", str(spec_path)],
+            stdout=log_f, stderr=subprocess.STDOUT,
+        )
+        running[kk] = (proc, log_f, spec_path, tr, va, te)
+        print(f"  launched fold {kk} (pid {proc.pid}) → {log_path}")
+
+    while pending or running:
+        while pending and len(running) < n_parallel:
+            _launch(pending.pop(0))
+        for kk in list(running):
+            proc, log_f, spec_path, tr, va, te = running[kk]
+            ret = proc.poll()
+            if ret is None:
+                continue
+            log_f.close()
+            fold_dir = Path(out_dir) / "sliding" / f"fold_{kk}"
+            result_path = fold_dir / "fold_result.json"
+            if ret == 0 and result_path.exists():
+                row = json.loads(result_path.read_text())
+                test_eq = pd.read_csv(fold_dir / "test_equity.csv", index_col=0, parse_dates=True)
+                trades_path = fold_dir / "test_trades.csv"
+                test_trades = pd.read_csv(trades_path) if trades_path.exists() else pd.DataFrame()
+                print(f"  fold {kk} done: test_return={row.get('test_return_pct')}")
+            else:
+                row = {
+                    "fold": kk,
+                    "train_start": str(tr.index.min().date()), "train_end": str(tr.index.max().date()),
+                    "test_start": str(te.index.min().date()), "test_end": str(te.index.max().date()),
+                    "val_return_pct": None, "val_profit_factor": None,
+                    "test_return_pct": None, "test_sharpe": None,
+                    "test_profit_factor": None, "test_win_rate_pct": None,
+                    "test_max_dd_pct": None, "test_avg_r": None,
+                    "test_n_trades": None, "error": f"worker exited {ret}",
+                }
+                test_eq, test_trades = pd.DataFrame(), pd.DataFrame()
+                print(f"  fold {kk} FAILED (exit {ret}) — see {fold_dir / 'worker.log'}")
+            row["_test_equity"] = test_eq
+            row["_test_trades"] = test_trades
+            summary_rows.append(row)
+            del running[kk]
+        if running:
+            import time as _t
+            _t.sleep(2.0)
+
+    summary_rows.sort(key=lambda r: r["fold"])
+    return summary_rows
+
+
 def train_sliding_walk_forward(
     total_timesteps: int = 3_000_000,
     seed: int = 42,
@@ -933,8 +1115,9 @@ def train_sliding_walk_forward(
     train_episode_steps: int = 2048,
     target_evals_per_fold: int = 20,
     dd_penalty: float = 0.8,
-    n_envs: int = 4,
-    device: str = "auto",
+    n_envs: int | None = None,
+    device: str | None = None,
+    n_parallel_folds: int | None = None,
 ):
     """Sliding-window walk-forward that simulates periodic retraining.
 
@@ -952,8 +1135,20 @@ def train_sliding_walk_forward(
 
     Per-fold timesteps are fixed because every train window is the same calendar
     length, so equal timesteps already means equal passes over the data.
+
+    ``n_parallel_folds`` > 1 runs folds in subprocess workers (Track A4):
+    each fold gets its own process and CUDA context, artifacts stay in the same
+    per-fold directories, and only the orchestration is concurrent.
+
+    ``n_envs`` / ``device`` / ``n_parallel_folds`` default to the values in
+    ``config.CFG`` (A2/A3 tuning knobs) when left as None.
     """
     from evaluate import full_report
+
+    n_envs = CFG.default_n_envs if n_envs is None else n_envs
+    device = CFG.default_device if device is None else device
+    n_parallel_folds = (CFG.default_n_parallel_folds if n_parallel_folds is None
+                        else n_parallel_folds)
 
     m1, feat, feature_cols = _load_decision_features()
     folds = make_sliding_folds(
@@ -974,7 +1169,8 @@ def train_sliding_walk_forward(
           f"(train {CFG.sliding_train_years:g}y → val {CFG.sliding_val_months}m → "
           f"test {CFG.sliding_test_months}m, slide {CFG.sliding_step_months}m)")
     print(f"  {total_timesteps:,} steps/fold × {n_folds} folds = "
-          f"~{total_timesteps * n_folds:,} env-steps total. envs={n_envs}.")
+          f"~{total_timesteps * n_folds:,} env-steps total. envs={n_envs}"
+          + (f", parallel folds={n_parallel_folds}" if n_parallel_folds > 1 else ""))
     print("  Schedule (each row = retrain + 'live' test window):")
     for k, (tr, va, te) in enumerate(folds, start=1):
         print(f"    fold {k:>2}: train {tr.index.min().date()}→{tr.index.max().date()}"
@@ -983,56 +1179,53 @@ def train_sliding_walk_forward(
     print("=" * 72)
 
     summary_rows: list[dict] = []
-    test_equities: list[pd.DataFrame] = []
-    test_trade_logs: list[pd.DataFrame] = []
-
-    for k, (tr, va, te) in enumerate(folds, start=1):
-        fold_dir = str(Path(out_dir) / "sliding" / f"fold_{k}")
-        eval_freq_k = max(25_000, total_timesteps // target_evals_per_fold)
-        print(f"\n── Fold {k}/{n_folds}"
-              f"  | train {len(tr):,}  val {len(va):,}  test {len(te):,} bars"
-              f"  | TEST {te.index.min().date()}→{te.index.max().date()}  → {fold_dir}")
-
-        train(
-            total_timesteps=total_timesteps,
-            seed=seed,
-            out_dir=fold_dir,
+    if n_parallel_folds > 1:
+        spec_common = dict(
+            total_timesteps=total_timesteps, seed=seed,
             train_episode_steps=train_episode_steps,
-            eval_freq=eval_freq_k,
-            dd_penalty=dd_penalty,
-            n_envs=n_envs,
-            device=device,
-            reveal_test=False,
-            datasets=(m1, feature_cols, tr, va, te),
+            target_evals_per_fold=target_evals_per_fold,
+            dd_penalty=dd_penalty, n_envs=n_envs, device=device,
+            # Charts are diagnostic-only; the production fold is re-plotted by
+            # _finalize_deployment's artifacts and final_holdout_eval.py (A6).
+            post_eval_chart=False,
         )
+        summary_rows = _run_folds_in_parallel(folds, n_folds, n_parallel_folds,
+                                              out_dir, spec_common)
+    else:
+        for k, (tr, va, te) in enumerate(folds, start=1):
+            fold_dir = str(Path(out_dir) / "sliding" / f"fold_{k}")
+            eval_freq_k = max(25_000, total_timesteps // target_evals_per_fold)
+            print(f"\n── Fold {k}/{n_folds}"
+                  f"  | train {len(tr):,}  val {len(va):,}  test {len(te):,} bars"
+                  f"  | TEST {te.index.min().date()}→{te.index.max().date()}  → {fold_dir}")
 
-        # Evaluate the deployable (best) checkpoint on val (reference) and on the
-        # untouched TEST window (the honest out-of-sample result).
-        model, vp = _load_fold_model(fold_dir)
-        val_rep = evaluate_on_split(model, vp, m1, feature_cols, va)
-        test_eq, test_trades, test_rep = _rollout_on_split(model, vp, m1, feature_cols, te)
-        test_equities.append(test_eq)
-        if test_trades is not None and not test_trades.empty:
-            test_trade_logs.append(test_trades)
+            row, test_eq, test_trades = _run_sliding_fold(
+                k, tr, va, te, m1, feature_cols,
+                total_timesteps=total_timesteps, seed=seed, out_dir=out_dir,
+                train_episode_steps=train_episode_steps, dd_penalty=dd_penalty,
+                n_envs=n_envs, device=device, eval_freq=eval_freq_k,
+                post_eval_chart=(k == n_folds),
+            )
+            row["_test_equity"] = test_eq
+            row["_test_trades"] = test_trades
+            summary_rows.append(row)
+            print(f"   fold {k} TEST: return={row['test_return_pct']:+.1f}%  "
+                  f"PF={row['test_profit_factor']:.2f}  "
+                  f"Sharpe={row['test_sharpe']:+.2f}  "
+                  f"trades={row['test_n_trades']}")
 
-        summary_rows.append({
-            "fold": k,
-            "train_start": tr.index.min().date(), "train_end": tr.index.max().date(),
-            "test_start": te.index.min().date(), "test_end": te.index.max().date(),
-            "val_return_pct": val_rep.get("total_return_pct"),
-            "val_profit_factor": val_rep.get("profit_factor"),
-            "test_return_pct": test_rep.get("total_return_pct"),
-            "test_sharpe": test_rep.get("sharpe_like"),
-            "test_profit_factor": test_rep.get("profit_factor"),
-            "test_win_rate_pct": test_rep.get("win_rate_pct"),
-            "test_max_dd_pct": test_rep.get("max_drawdown_pct"),
-            "test_avg_r": test_rep.get("avg_r"),
-            "test_n_trades": test_rep.get("n_trades"),
-        })
-        print(f"   fold {k} TEST: return={test_rep.get('total_return_pct'):+.1f}%  "
-              f"PF={test_rep.get('profit_factor'):.2f}  "
-              f"Sharpe={test_rep.get('sharpe_like'):+.2f}  "
-              f"trades={test_rep.get('n_trades')}")
+    # Separate the DataFrame payload from the artifact frames for reporting.
+    # Pop both keys from every row (including failed folds) so no frame objects
+    # leak into the summary DataFrame / CSV.
+    test_equities = []
+    test_trade_logs = []
+    for r in summary_rows:
+        eq = r.pop("_test_equity", None)
+        tr = r.pop("_test_trades", None)
+        if eq is not None:
+            test_equities.append(eq)
+        if tr is not None and len(tr):
+            test_trade_logs.append(tr)
 
     summary = pd.DataFrame(summary_rows)
     summary_path = Path(out_dir) / "sliding_walk_forward_summary.csv"
@@ -1096,4 +1289,8 @@ if __name__ == "__main__":
     # simulation; stitches a continuous out-of-sample test track record).
     # For the block-fold scheme call train_walk_forward(); for a single
     # chronological split call train() directly.
-    train_sliding_walk_forward()
+    # Track A4: `--fold-worker <spec.json>` runs exactly one sliding fold in
+    # this process (spawned by train_sliding_walk_forward's parallel driver).
+    if len(sys.argv) >= 3 and sys.argv[1] == "--fold-worker":
+        raise SystemExit(_fold_worker_main(sys.argv[2]))
+    raise SystemExit(train_sliding_walk_forward() or 0)

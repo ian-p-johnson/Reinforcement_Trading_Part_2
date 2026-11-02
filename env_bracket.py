@@ -38,6 +38,16 @@ class BracketTradingEnv(gym.Env):
         direction: 0 flat/close, 1 long, 2 short
         sl bucket: ATR multiplier index
         tp bucket: R-multiple index
+
+    Performance notes (Track A refactor, see DECISIONS.md D1–D8):
+        * Observation inputs are precomputed as contiguous numpy arrays at
+          construction time; no pandas row access happens per step.
+        * The intrabar TP/SL scan is vectorised over the M1 window instead of a
+          per-bar Python loop (same scan order, same SL-first tie rule).
+        * Step history is kept in preallocated arrays; ``equity_curve()``
+          builds the familiar DataFrame on demand.
+        * ``info`` carries ``TimeLimit.truncated`` so on-policy learners
+          bootstrap the value function at episode truncation.
     """
 
     metadata = {"render_modes": []}
@@ -60,8 +70,7 @@ class BracketTradingEnv(gym.Env):
         randomize_start: bool = False,
     ):
         super().__init__()
-        self.decision_df = decision_df.dropna(subset=feature_cols + ["atr"]).copy()
-        self.m1_df = m1_df.copy()
+        self.decision_df = decision_df.dropna(subset=feature_cols + ["atr"])
         self.feature_cols = list(feature_cols)
         self.sl_atr_multipliers = tuple(sl_atr_multipliers)
         self.tp_r_multipliers = tuple(tp_r_multipliers)
@@ -76,13 +85,24 @@ class BracketTradingEnv(gym.Env):
 
         self.randomize_start = randomize_start
 
-        # Pre-extract M1 high/low as contiguous numpy arrays and cache the
-        # sorted DatetimeIndex for O(log n) searchsorted lookups.
-        # This replaces the O(n) boolean-mask scan on every step — with 1.5 M
-        # M1 bars the speedup is ~100-200x per step.
-        self._m1_high  = self.m1_df["High"].to_numpy(dtype=np.float64)
-        self._m1_low   = self.m1_df["Low"].to_numpy(dtype=np.float64)
-        self._m1_index = self.m1_df.index  # DatetimeIndex (sorted, tz-aware)
+        # ── Precomputed per-step inputs (D1/D2) ──────────────────────────────
+        # Feature matrix cast once to float32 and sanitised exactly like the old
+        # per-step path did (cast first, then nan_to_num) so values are bit-
+        # identical to the pre-refactor implementation.
+        feat32 = self.decision_df[self.feature_cols].to_numpy(dtype=np.float32)
+        self._feat = np.nan_to_num(feat32, nan=0.0, posinf=10.0, neginf=-10.0)
+        self._close = self.decision_df["Close"].to_numpy(dtype=np.float64)
+        self._atr = self.decision_df["atr"].to_numpy(dtype=np.float64)
+        self._decision_index = self.decision_df.index
+
+        # ── M1 execution data (D6: extract arrays, no redundant frame copy) ─
+        # The caller (e.g. train_ppo._slice_m1_for_decision_window) already
+        # hands over a private slice; only the high/low arrays and the index are
+        # used for simulation, so keep exactly one copy of those.
+        self.m1_df = m1_df
+        self._m1_high = np.ascontiguousarray(m1_df["High"].to_numpy(dtype=np.float64))
+        self._m1_low = np.ascontiguousarray(m1_df["Low"].to_numpy(dtype=np.float64))
+        self._m1_index = m1_df.index  # DatetimeIndex (sorted, tz-aware)
 
         self.action_space = spaces.MultiDiscrete([3, len(self.sl_atr_multipliers), len(self.tp_r_multipliers)])
 
@@ -94,7 +114,20 @@ class BracketTradingEnv(gym.Env):
             shape=(len(self.feature_cols) + self.n_pos_features,),
             dtype=np.float32,
         )
+
+        # ── Preallocated step history (D5) ───────────────────────────────────
+        n_max = len(self.decision_df)
+        self._hist_equity = np.empty(n_max, dtype=np.float64)
+        self._hist_realized = np.empty(n_max, dtype=np.float64)
+        self._hist_position = np.empty(n_max, dtype=np.int64)
+        self._hist_close = np.empty(n_max, dtype=np.float64)
+        self._hist_reward = np.empty(n_max, dtype=np.float64)
+        self._hist_start = 0
+        self._hist_n = 0
+
         self.reset()
+
+    # ── lifecycle ────────────────────────────────────────────────────────────
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
@@ -111,23 +144,26 @@ class BracketTradingEnv(gym.Env):
         self.realized_pnl = 0.0
         self.position = Position()
         self.trades: List[Dict[str, Any]] = []
-        self.history: List[Dict[str, Any]] = []
+        self._hist_start = self.i
+        self._hist_n = 0
         obs = self._observation()
         return obs, {}
 
+    # ── observation / state helpers ──────────────────────────────────────────
+
     def _current_row(self):
+        """Compatibility shim (D7): pandas row for external callers/baselines."""
         return self.decision_df.iloc[self.i]
 
     def _current_time(self):
-        return self.decision_df.index[self.i]
+        return self._decision_index[self.i]
 
     def _next_time(self):
-        return self.decision_df.index[min(self.i + 1, len(self.decision_df) - 1)]
+        return self._decision_index[min(self.i + 1, len(self.decision_df) - 1)]
 
     def _position_state_features(self) -> np.ndarray:
-        row = self._current_row()
-        close = float(row["Close"])
-        atr = max(float(row["atr"]), 1e-12)
+        close = self._close[self.i]
+        atr = max(self._atr[self.i], 1e-12)
         p = self.position
         if p.direction == 0:
             return np.array([0, 0, 0, 0, 0, 0], dtype=np.float32)
@@ -146,12 +182,13 @@ class BracketTradingEnv(gym.Env):
         ], dtype=np.float32)
 
     def _observation(self):
-        row = self._current_row()
-        market = row[self.feature_cols].astype(float).to_numpy(dtype=np.float32)
+        market = self._feat[self.i]                      # pre-sanitised float32
         pos = self._position_state_features()
         obs = np.concatenate([market, pos]).astype(np.float32)
         obs = np.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
         return obs
+
+    # ── trade mechanics ──────────────────────────────────────────────────────
 
     def _entry_price(self, close: float, direction: int) -> float:
         return close + direction * (self.spread_price / 2.0 + self.slippage_price)
@@ -161,9 +198,8 @@ class BracketTradingEnv(gym.Env):
         return price - direction * (self.spread_price / 2.0 + self.slippage_price)
 
     def _open_position(self, direction: int, sl_idx: int, tp_idx: int):
-        row = self._current_row()
-        close = float(row["Close"])
-        atr = max(float(row["atr"]), 1e-12)
+        close = self._close[self.i]
+        atr = max(self._atr[self.i], 1e-12)
         sl_atr_mult = self.sl_atr_multipliers[sl_idx]
         sl_dist = max(sl_atr_mult * atr, 1e-8)
         tp_r = self.tp_r_multipliers[tp_idx]
@@ -218,43 +254,60 @@ class BracketTradingEnv(gym.Env):
     def _simulate_m1_until_next_decision(self) -> float:
         """Advance within the next decision interval and close if TP/SL is touched.
 
-        Uses DatetimeIndex.searchsorted (O log n) + pre-cached numpy arrays to
-        avoid a full pandas boolean-mask scan on each step (~100-200x faster on
-        a multi-year M1 dataset).
+        Vectorised form (D3): the M1 window is scanned in one numpy pass and the
+        first-touch index of each level is compared.  Semantics are identical to
+        the original per-bar loop:
+
+            * windows are half-open ``(start, end]`` (searchsorted "right"),
+            * within one M1 bar SL is checked before TP (pessimistic rule), so
+              a same-bar double touch resolves to SL,
+            * an empty window leaves the position untouched.
         """
         p = self.position
         if p.direction == 0:
             return 0.0
 
         start = self._current_time()
-        end   = self._next_time()
+        end = self._next_time()
 
         # Half-open interval (start, end]: "right" excludes start, includes end.
         lo = int(self._m1_index.searchsorted(start, side="right"))
-        hi = int(self._m1_index.searchsorted(end,   side="right"))
+        hi = int(self._m1_index.searchsorted(end, side="right"))
+        if hi <= lo:
+            return 0.0
 
-        realized = 0.0
-        for idx in range(lo, hi):
-            high = self._m1_high[idx]
-            low  = self._m1_low[idx]
-            p = self.position
-            if p.direction == 0:
-                break
-            if p.direction == 1:
-                sl_hit = low  <= p.sl
-                tp_hit = high >= p.tp
-            else:
-                sl_hit = high >= p.sl
-                tp_hit = low  <= p.tp
+        highs = self._m1_high[lo:hi]
+        lows = self._m1_low[lo:hi]
+        if p.direction == 1:
+            sl_mask = lows <= p.sl
+            tp_mask = highs >= p.tp
+        else:
+            sl_mask = highs >= p.sl
+            tp_mask = lows <= p.tp
 
-            # Pessimistic intrabar rule: if both touched, assume SL first.
-            if sl_hit:
-                realized += self._close_position(p.sl, self._m1_index[idx], "SL")
-                break
-            if tp_hit:
-                realized += self._close_position(p.tp, self._m1_index[idx], "TP")
-                break
-        return realized
+        # First touch of each level inside the window (window order preserved).
+        sl_any = sl_mask.any()
+        tp_any = tp_mask.any()
+        if not (sl_any or tp_any):
+            return 0.0
+
+        # SL wins ties (same-bar double touch) -> pessimistic rule.
+        if sl_any:
+            sl_rel = int(np.argmax(sl_mask))
+        else:
+            sl_rel = None
+        if tp_any:
+            tp_rel = int(np.argmax(tp_mask))
+        else:
+            tp_rel = None
+
+        if sl_rel is not None and (tp_rel is None or sl_rel <= tp_rel):
+            idx = lo + sl_rel
+            return self._close_position(p.sl, self._m1_index[idx], "SL")
+        idx = lo + tp_rel
+        return self._close_position(p.tp, self._m1_index[idx], "TP")
+
+    # ── gym API ──────────────────────────────────────────────────────────────
 
     def step(self, action):
         action = np.asarray(action, dtype=int)
@@ -263,8 +316,7 @@ class BracketTradingEnv(gym.Env):
 
         prev_equity = self.equity
         reward_risk_unit = max(prev_equity * self.risk_fraction, 1e-12)
-        row = self._current_row()
-        close = float(row["Close"])
+        close = self._close[self.i]
 
         # Handle explicit close or flip at current decision close.
         if self.position.direction != 0:
@@ -289,7 +341,7 @@ class BracketTradingEnv(gym.Env):
         # the trade is open, without leaking any future price information.
         if self.position.direction != 0:
             self.position.bars_in_trade += 1
-            current_close = float(self.decision_df.iloc[self.i]["Close"])
+            current_close = self._close[self.i]
             unrealized = (current_close - self.position.entry_price) * self.position.units * self.position.direction
         else:
             unrealized = 0.0
@@ -299,27 +351,42 @@ class BracketTradingEnv(gym.Env):
             reward += (unrealized / max(self.position.risk_cash, 1e-12)) * self.reward_mtm_weight
             reward -= self.holding_penalty
 
-        self.history.append({
-            "time": self._current_time(),
-            "equity": self.equity,
-            "realized_pnl": self.realized_pnl,
-            "position": self.position.direction,
-            "close": close,
-            "reward": reward,
-        })
+        # Preallocated history (D5); recorded before the index advances so the
+        # time column matches the pre-refactor history exactly.
+        n = self._hist_n
+        self._hist_equity[n] = self.equity
+        self._hist_realized[n] = self.realized_pnl
+        self._hist_position[n] = self.position.direction
+        self._hist_close[n] = close
+        self._hist_reward[n] = reward
+        self._hist_n = n + 1
 
         self.i += 1
         self.steps += 1
         terminated = self.i >= len(self.decision_df) - 2
         truncated = self.steps >= self.max_episode_steps
         obs = self._observation() if not (terminated or truncated) else np.zeros(self.observation_space.shape, dtype=np.float32)
-        info = {"equity": self.equity, "n_trades": len(self.trades)}
+        # D8: let on-policy learners bootstrap the value function when the
+        # episode was cut by the step limit rather than by the data ending.
+        info = {"equity": self.equity, "n_trades": len(self.trades),
+                "TimeLimit.truncated": bool(truncated)}
         return obs, float(reward), terminated, truncated, info
 
+    # ── results access ───────────────────────────────────────────────────────
+
     def equity_curve(self) -> pd.DataFrame:
-        if not self.history:
+        """Per-step account history, same schema as before the refactor."""
+        if self._hist_n == 0:
             return pd.DataFrame(columns=["time", "equity", "realized_pnl", "position", "close", "reward"])
-        return pd.DataFrame(self.history).set_index("time")
+        n = self._hist_n
+        idx = self._decision_index[self._hist_start:self._hist_start + n]
+        return pd.DataFrame({
+            "equity": self._hist_equity[:n],
+            "realized_pnl": self._hist_realized[:n],
+            "position": self._hist_position[:n],
+            "close": self._hist_close[:n],
+            "reward": self._hist_reward[:n],
+        }, index=pd.Index(idx, name="time"))
 
     def trade_log(self) -> pd.DataFrame:
         return pd.DataFrame(self.trades)

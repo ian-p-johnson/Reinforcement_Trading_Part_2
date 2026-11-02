@@ -37,7 +37,7 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     idx_utc = idx_local.tz_convert("UTC") if idx_local.tz is not None else idx_local.tz_localize("UTC")
 
     minute_of_day = idx_local.hour * 60 + idx_local.minute
-    day_of_week = idx_local.dayofweek
+    day_of_week = idx_local.day_of_week
 
     out["tod_sin"] = np.sin(2 * np.pi * minute_of_day / 1440.0)
     out["tod_cos"] = np.cos(2 * np.pi * minute_of_day / 1440.0)

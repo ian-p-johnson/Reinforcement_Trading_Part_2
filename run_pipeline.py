@@ -8,12 +8,9 @@ import pandas as pd
 from config import CFG
 from data_loader import (
     describe_data,
-    load_mt_ohlcv_csv,
     make_walk_forward_folds,
-    resample_ohlcv,
     split_train_val_test,
 )
-from features import prepare_feature_frame
 from leakage_checks import assert_feature_stability_when_future_appended
 from env_bracket import BracketTradingEnv
 from baselines import (
@@ -106,28 +103,12 @@ def main():
     out_dir.mkdir(exist_ok=True)
 
     print("Loading M1 data...")
-    m1 = load_mt_ohlcv_csv(
-        CFG.csv_path,
-        time_col=CFG.time_col,
-        source_tz=CFG.source_tz,
-        timestamp_is_bar_open=CFG.timestamp_is_bar_open,
-        bar_duration=CFG.pandas_execution_tf,
-        start_date=CFG.start_date,
-        end_date=CFG.end_date,
-        max_days_for_demo=CFG.max_days_for_demo,
-    )
+    from data_cache import load_all
+    m1, decision, feat, feature_cols = load_all()
     print(describe_data(m1))
 
-    print(f"Resampling to decision timeframe: {CFG.decision_timeframe}  ({CFG.pandas_tf})")
-    decision = resample_ohlcv(m1, CFG.pandas_tf)
-
-    print("Building causal stationary features...")
-    feat, feature_cols = prepare_feature_frame(
-        decision,
-        warmup_bars=CFG.warmup_bars,
-        atr_period=CFG.atr_period,
-        rsi_period=CFG.rsi_period,
-    )
+    print(f"Decision timeframe: {CFG.decision_timeframe}  ({CFG.pandas_tf})")
+    print("Causal stationary features built.")
     print(f"Decision bars after warmup: {len(feat):,}")
     print(f"Feature count: {len(feature_cols)}")
 

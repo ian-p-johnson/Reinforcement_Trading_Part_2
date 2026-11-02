@@ -1,0 +1,19 @@
+# Data & caches
+data/
+data/cache/
+
+# Environments
+.venv/
+__pycache__/
+*.pyc
+
+# Run artifacts
+models/
+outputs/
+
+# Tooling
+.pytest_cache/
+.ipynb_checkpoints/
+
+# NOTE: tests/golden/ is deliberately NOT ignored — those fixtures freeze the
+# pre-Track-A environment behaviour (DECISIONS.md P1) and must be committed.

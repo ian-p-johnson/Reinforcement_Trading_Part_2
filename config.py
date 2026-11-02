@@ -36,7 +36,7 @@ class ProjectConfig:
     # Path to your full MT4/MT5-style minute CSV.
     # Long Bid file (May 2003 – May 2026, ~23 years) — primary dataset: enough
     # history for several walk-forward folds plus a multi-year sealed test.
-    csv_path: Path = Path("data/XAUUSD_1 Min_Bid_2003.05.05_2026.05.31.csv")
+    csv_path: Path = Path("data/XAUUSD_1m_EET.csv")
     # Short Ask file (Jan 2020 – Jan 2026, ~6 years) — kept as a fast smoke-test
     # dataset; uncomment to fall back to it.
     #csv_path: Path = Path("data/XAUUSD_1 Min_Ask_2020.01.09_2026.01.15.csv")
@@ -147,6 +147,22 @@ class ProjectConfig:
     # Reward shaping.
     holding_penalty: float = 0.00002
     reward_mtm_weight: float = 0.01
+
+    # ── Parallelism & device (Track A2/A3, DECISIONS.md D11/D12) ───────────
+    # torch_threads: torch's default is "all cores", which is pathological for
+    # PPO's tiny matmuls (measured 15x slowdown from thread oversubscription on
+    # a 20-core machine; compounding across parallel fold workers). Cap it.
+    torch_threads: int = 4
+    # Default device + vectorization width for train_sliding_walk_forward are
+    # set from benchmarks.py measurements (see DECISIONS.md "A2/A3 sweep").
+    # Measured (post-A1 env, 100k steps, this machine): cpu/4threads beats cuda
+    # at every width — 5,036 vs 2,574 steps/s at n_envs=4; 10,377 vs 6,846 at 16.
+    default_device: str = "cpu"
+    # n_envs=4 x n_parallel_folds=4 fits the 20-core budget (4 x (4 envs + 1
+    # main) = 20) and is the config validated by the 34-fold smoke sweep.
+    # Single-fold runs should pass n_envs=16 (2x throughput) instead.
+    default_n_envs: int = 4
+    default_n_parallel_folds: int = 4
 
     # ── PPO regularisation (generalisation-first preset) ─────────────────────
     # The knobs that most directly control overfitting. Tune these between runs.

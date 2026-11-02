@@ -1,8 +1,18 @@
-pandas>=2.0
-numpy>=1.24
-plotly>=5.18
-nbformat>=5.9
-gymnasium>=0.29
-stable-baselines3>=2.3
-tqdm>=4.66
-scikit-learn>=1.3
+# Pinned to the versions actually in use (DECISIONS.md D17) — this repo's
+# value is reproducible walk-forward numbers, so exact pins over loose bounds.
+pandas==3.1.0
+numpy==2.5.4
+plotly==7.1.0
+nbformat==5.11.1
+gymnasium==1.4.0
+stable-baselines3==2.9.2
+tqdm==4.70.1
+scikit-learn==1.9.1
+
+# Track A additions
+pyarrow==26.0.0     # parquet data cache (data_cache.py)
+pytest==9.2.0       # tests/
+
+# Install the torch build matching your CUDA toolkit manually, e.g.
+#   pip install torch==2.15.0 --index-url https://download.pytorch.org/whl/cu126
+torch>=2.15.0,<3.0

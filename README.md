@@ -80,13 +80,32 @@ notebooks/XAUUSD_RL_Pipeline_Demo.ipynb
 
 - `config.py`: all main parameters.
 - `data_loader.py`: CSV parsing, timezone handling, validation, resampling.
+- `data_cache.py`: parquet cache for the parsed M1 frame + H1 feature frame (Track A5); all entry points route through it. `python data_cache.py --rebuild|--clear`.
 - `features.py`: causal indicators and stationary feature matrix.
 - `leakage_checks.py`: simple future-append stability test.
 - `env_bracket.py`: Gymnasium-compatible bracket trading environment.
 - `baselines.py`: random and EMA/ATR rule policies.
 - `evaluate.py`: metrics, trade-log summary, drawdown.
 - `visualize.py`: Plotly visualization functions.
-- `train_ppo.py`: optional PPO training scaffold.
+- `train_ppo.py`: optional PPO training scaffold. `python train_ppo.py` runs the sliding walk-forward (folds run in parallel subprocess workers by default — see `CFG.default_n_parallel_folds`).
 - `run_pipeline.py`: one-command pre-test pipeline with validation-only outputs.
 - `final_holdout_eval.py`: explicit one-time holdout evaluation entry point.
+- `benchmarks.py`: runnable perf suite (env/vec-env/learn/data timings) for before/after comparisons.
 - `notebooks/XAUUSD_RL_Pipeline_Demo.ipynb`: guided notebook.
+
+## Tests
+
+```bash
+python -m pytest tests/ -q
+```
+
+Hermetic (synthetic data, no GPU, no CSV needed): env parity against committed golden traces
+(`tests/golden/` — frozen pre-refactor behaviour), a vectorized-vs-reference intrabar oracle,
+split/embargo/leakage invariants, and data-cache parity. `tests/make_golden.py --check` replays the
+same fixtures standalone.
+
+## Development notes
+
+- `DECISIONS.md`: implementation decision log (why the code is the way it is).
+- `LUT_SPEC.md`: correct design for the precomputed first-touch lookup used by the GPU/vectorized ports.
+- `ARTIFACTS.md`: frozen artifact/schema conventions any engine must preserve.
