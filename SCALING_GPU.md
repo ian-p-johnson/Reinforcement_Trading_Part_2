@@ -272,3 +272,173 @@ reports up to ~50× over the CPU baseline when the whole node is used. Only go m
 PureJaxRL patterns, JaxMARL-HFT as your in-domain template) to get GPU-resident swarms within weeks, use
 PufferLib if you want the win without leaving Python, and run cutile/cuda-oxide as a timeboxed Rust/CUDA kernel
 spike where you get the Rust progress without betting the pipeline on an alpha toolchain.*
+
+---
+
+## 6. Results & conclusions — what actually happened (Tracks A/B/C)
+
+Everything in §§1–5 above is pre-implementation analysis. This section is the post-implementation
+record: what was built, what it measured, and which predictions held. All numbers below were
+measured on this machine (RTX 5070 Ti Laptop, sm_120, 12 GB, driver 590.48.01 / CUDA 13.1,
+20 cores) unless noted. Decision-by-decision log: `DECISIONS.md` (Track A D1–D21/P1–P6, Track B
+D22–D58, Track C D59–D64); toolchain repro: `toolchain.md`; full suite: **91 tests green**.
+
+### 6.1 Track A — Python quick wins (the baseline that makes every comparison below honest)
+
+| Item | Result |
+|---|---|
+| A1 env refactor | **~15×** (2,521–3,640 → **37,854 steps/s** random actions, 26 µs/step; 173,931/s flat; `_observation()` 244 µs → 4.3 µs = 57×). Bit-parity vs pre-refactor traces: 10 golden fixtures, obs bitwise / floats ≤1e-9 |
+| A2 thread cap | `torch_threads=4` turns a thrashing sweep into a working one: per-fold **~21 → ~1,200 steps/s**, load avg **99 → 6.5** on 20 cores |
+| A2/A3 device & width | **CPU beats CUDA at every width** for this MLP (5,036 vs 2,574 steps/s @ n_envs=4; 10,377 vs 6,846 @ 16); n_envs 4→16 ≈ 2×. Defaults: `cpu`, `torch_threads=4`, 4 folds × 4 envs |
+| A4 fold driver | 34/34 sliding folds end-to-end (toy budget) in ~9 min, 4 subprocess workers; artifacts + gate + stitched OOS unchanged |
+| A5 data cache | cold 6.57 s → warm **0.24 s (27×)**; byte-identical parquet (7.9 M M1 rows) |
+| A7 correctness | truncation bootstrap (`TimeLimit.truncated`), block-WF checkpoint fix, pinned requirements |
+
+Performance observations that shaped the design: pandas row access was **244 µs of a 275 µs step**
+(vs ~1 µs for a numpy gather) — obs construction, not simulation, was the original bottleneck; SB3's
+per-vector-step fixed cost (~1.19 ms, `predict` + VecNormalize + IPC) caps any SB3 pipeline at a few
+thousand steps/s no matter how fast the env gets; tiny-matmul PPO on 20 cores is **15× slower** with
+torch's default thread count than with 4; and GPU util under SB3 was **13–30 % at 352 MiB** — the
+GPU was present but idle, which is the measured justification this whole document argued from.
+
+### 6.2 Track B — JAX port: the predicted 10²–10⁴× lands as **187× end-to-end**
+
+**Correctness first (the gate that everything else stands on):**
+* `jax_env` (gymnax-style f64 env, padded-window gather per `LUT_SPEC.md` §3.4) — **41-test parity
+  gate green on both CPU and CUDA backends**, observed trace difference **0.0 (bit-exact)** against
+  the pandas env on every scenario: 10 golden fixtures, live deep-compares, 5 random seeds, 3 exact
+  level-tie constructions (≤/≥ inclusivity, SL-first double touch), a full sliding-fold rollout of a
+  real Track-A model vs `_rollout_on_split`, and `evaluate.full_report` metric parity.
+* `jax_ppo` (PureJaxRL-structure trainer) — source-verified SB3 mappings pinned by unit tests: GAE
+  vs a transcription of `compute_returns_and_advantage` (≤1e-5), one PPO update vs torch (grads
+  within ~6e-4 rel — f32 reduction-order noise; optimizer chain vs an independent Adam(wd)
+  transcription ≤1e-5), `RunningMeanStd` vs SB3's class (1e-12), a full VecNormalize obs/reward
+  stream vs SB3's `VecNormalize` (1e-6).
+
+**Throughput (`jax_benchmarks.py all --data real`):**
+
+| Measurement | Result | vs SB3 / plan |
+|---|---|---|
+| env-only vmap step @ 1k envs | 42.3 M steps/s | plan predicted 10⁶–10⁷ class |
+| @ 4k / 16k / 64k envs | 130.3 M / 162.0 M / **213.0 M steps/s** | vs SB3 pipeline 1.65–2.65 k steps/s |
+| end-to-end training (rollout+GAE+update) @ 64×256 | **494,236 steps/s** | **≈187× the best SB3 rate** |
+| compile per shape (rollout/gae/update) @ 64×256 | 0.96 s / 0.07 s / 0.87 s | ~2–5 s at the SB3-parity 4×2048 shape |
+| trajectory volume per rollout | **2.44 MB** (host pull < 0.05 ms) | plan expected ~MB |
+| VRAM residency (rollout+update) | **52 MB in use / 189 MB peak** | of 12 GB — swarm width is the remaining headroom |
+
+**The full production sweep (the DoD wall-clock target):** 34 folds × 3 M steps (102 M env-steps +
+per-fold consistency evals + val/test rollouts + per-fold JIT compiles) in **674 s ≈ 11.2 min** with
+4 parallel workers — the plan's "minutes-to-tens-of-minutes" goal met. The equivalent SB3 sweep
+extrapolates to **~2.8–3.5 h** (34 × 3 M at 1,886–2,649 steps/s with 4-fold parallelism); Track A
+never ran it at production budget. Outputs are schema-identical to the Track-A layout (summary
+columns, fold artifacts, gate, promotion, `NO_DEPLOY` semantics) via engine-aware loader branches —
+proven by the B4 driver tests, not assumed.
+
+**The sweep's own result, for the record:** stitched out-of-sample **+240.5 %** compounded, Sharpe
++0.63, max DD −36.5 %, PF 1.07 over 9,445 trades, 20/34 folds positive with PF>1 — and the
+consistency gate **correctly refused deployment** (worst-fold PF 0.77 < 0.90 → `NO_DEPLOY`). The
+gate logic transferred to the new engine without modification and caught the same kind of
+inconsistency it exists for.
+
+**Swarm economics (the point of the whole exercise):** 5-seed variance sweep in **75 s** (5 × 100 k
+steps) — val return **−10.8 % ± 12.2 %**, Sharpe −0.35 ± 0.46 across seeds. That quantifies
+`ANALYSIS.md` §7's single-seed-42 concern directly: seed variance is larger than most effect sizes
+being measured, and now it is cheap enough to report routinely.
+
+Quirk ledger (Blackwell specifics, all worked around and documented): cuSolver `Dgeqrf` (used by
+JAX's orthogonal init QR) raises INTERNAL errors mid-suite on sm_120 and poisons the context →
+host-side numpy QR for init (D45); torch's cuBLAS fails to initialise (`CUBLAS_STATUS_NOT_INITIALIZED`)
+when JAX holds VRAM in a shared process → eval-path `PPO.load` pinned to CPU (D57); JAX's default
+matmul precision is TF32 (1e-2 error on a matmul check) → `highest` for this numerical work; the
+sm_120 jit-cache bug reported against jax 0.10.x did not reproduce on 0.12.0.1.
+
+### 6.3 Track C — the spike: kernel beats the gate by ~10³, loses the seam by 2× (both predicted)
+
+**C0 toolchain — all three surfaces pass on sm_120/driver 590** (`toolchain.md`): cuTile **Python**
+(cuda-tile 1.7.0 + tileiras 13.4 via pip, no system install), **cutile-rs** 0.4.0 (`cargo add cutile`),
+**cuda-oxide** (`cargo oxide run vecadd` under pinned Rust 1.99.1). The PTX-vs-old-driver trap did not
+reproduce; the real friction was compiler-alpha surface (kernel scalar ABI is **f32** — scalars had to
+move to buffers; `astype(int64)` hits a `trunci` verification bug; an i64 min-reduce **silently
+miscompiles** and corrupts neighbouring values — the kind of finding that only a differential parity
+harness catches).
+
+**C2 raw kernel throughput** (Formulation T, f64 state, one launch per step):
+
+| Envs/step | cuTile kernel | JAX vmap env (Track B) | numpy env (Track A ref) |
+|---|---|---|---|
+| 1,024 | 44.2 M steps/s | 42.3 M | ~14.9 k (plan's C2 baseline; A1 random-actions 37.9 k single-proc) |
+| 4,096 | 84.9 M | 130.3 M | — |
+| 16,384 | 126.7 M | 162.0 M | — |
+| 65,536 | **141.5 M** | **213.0 M** | — |
+
+**≈9,500× the numpy env** — the DoD gate was "≥10× (>150 k steps/s raw)"; met by ~3 orders of
+magnitude.
+
+**C3 seam decision record (the load-bearing question):** the kernel runs *inside `jax.jit`* through
+`cuda.tile.jax.cutile_call` with bit-exact outputs (`test_jax_ffi_seam_step`) — i.e. the §4 hybrid
+("JAX trainer + kernel bridge") is mechanically real. Measured on identical 128-step rollouts ×
+4,096 envs: **77.7 M steps/s through the seam vs 160.4 M for XLA-vmapped `jax_env.step` — the
+hand-written tile kernel is ~2× slower than the generic lowering** on this select-style, gather-heavy
+step (raw kernel 141.5 M vs 213 M at 64 k tells the same story outside the graph). Verdict (D63/D64):
+**keep the JAX trainer end-to-end; archive the seam; adopt the kernel + toolchain as the artifact.**
+Re-entry triggers are explicit: a step-function-LUT kernel (`LUT_SPEC.md` §3.1 — gather + binary
+search is where custom kernels plausibly beat generic lowering), a Burn/Rust trainer move (cutile-rs
+continuity, C0-validated), or intra-kernel policy/env fusion as a goal. Formulation S (cuda-oxide SIMT)
+was deliberately not implemented: it would need >2× the tile form to matter, and the env is not the
+bottleneck.
+
+### 6.4 Performance observations picked up en route (consolidated)
+
+1. **The bottleneck moved twice.** Originally obs construction (244 µs/step); after A1 it was SB3's
+   per-step Python loop (~1.19 ms/vec-step ceiling, GPU idle at 13–30 %); after the JAX port the env
+   is *thousandfold* over-provisioned (213 M env-steps/s vs 494 k end-to-end) — the PPO update/rollout
+   machinery is now the constraint. Env-kernel optimisation is the wrong lever at every stage so far,
+   which is exactly why Track C's honest answer is "no seam today".
+2. **Small-MLP RL on one GPU is a CPU workload under SB3** (CPU 2,649 vs CUDA 1,739 steps/s; per-step
+   `predict` transfer ~0.9 ms CUDA vs 0.41 ms CPU) but a GPU workload under JAX (one `jit`, zero
+   per-step host involvement) — the framework, not the hardware, decided where this ran.
+3. **Thread hygiene beats algorithmic tuning in shared sweeps:** torch's default 20 threads made
+   multi-fold sweeps 50× slower than a 4-thread cap (load 99 vs 6.5).
+4. **JAX numerical hygiene:** TF32 is the matmul default (10⁻² errors); x64 money math is bit-exact
+   on this GPU; cross-toolchain f64 is 1-ulp (≤2e-13 measured vs the kernel) — tolerances must be
+   policy, not hope (D32/D49).
+5. **One GPU, many processes:** JAX preallocates 75 % VRAM by default and breaks co-tenants
+   (cuBLAS init failure) — `XLA_PYTHON_CLIENT_PREALLOCATE=false` for parallel fold workers (D52),
+   CPU loads for eval-path torch (D57). Peak footprint of the whole JAX pipeline: 189 MB.
+6. **VRAM is not the swarm constraint** — 52–189 MB of 12 GB in use; compile time and per-fold data
+   prep are what a 34-fold sweep pays, not memory.
+7. **Seed variance (−10.8 % ± 12.2 %) exceeds most effect sizes** — single-seed RL results on thin
+   signals should be treated as anecdotes (now measurable in 75 s).
+8. **Parity harnesses catch silent kernel corruption** that unit tests cannot: the cuTile i64-reduce
+   miscompile produced plausible-but-wrong prices; only bit-level replay against the reference found
+   it. Same class of bug was found in the JAX toolchain path itself (`rollout_on_split` transposed
+   trade indexing — equity moved while `n_trades=0`), which is why artifact-producing paths got their
+   own regression tests.
+9. **Alpha-surface tax is real but bounded:** three GPU toolchains (cuTile, cutile-rs, cuda-oxide)
+   were installed and verified in one session; the surprises were compiler internals, not
+   environments — and every workaround is written down (`toolchain.md` §5) so the next person pays
+   minutes, not days.
+
+### 6.5 Conclusions
+
+* **Track A (adopted, shipped):** 15× env, 27× data ingress, and the harness (golden parity, gate,
+  artifacts) that made every later number trustworthy. It also established the negative result that
+  justified everything else: *SB3 cannot use this GPU.*
+* **Track B (adopted, shipped):** the §2 prediction ("10²–10⁴× env throughput, full sweep in
+  minutes") is measured fact — 213 M env-steps/s, 494 k end-to-end (187×), 34-fold production sweep
+  in 11.2 min, seed sweeps in 75 s. Parity is bit-exact against the pandas engine; the walk-forward
+  gate/summary/holdout machinery is unchanged and still does its job (it refused deployment on the
+  first JAX production run, correctly).
+* **Track C (timeboxed spike, concluded):** the §4b gate outcome in its positive form — kernel
+  ≥10× numpy env by ~10³, sm_120-under-driver-590 verified on **three** toolchains, and the trainer
+  seam chosen in writing with measured numbers. The seam verdict is *no seam*: XLA's vmapped env
+  beats the hand-written tile kernel ~2× here, so **JAX remains the GPU path** and the kernel,
+  parity suite and toolchain repro are kept as the validated artifact with explicit re-entry
+  triggers (LUT kernel, Rust trainer move, fusion goals).
+
+**Updated one-line summary (§5's prediction, scored):** *the framework was small and the data fixed,
+and the port to JAX (gymnax-style env + PureJaxRL-style trainer) delivered GPU-resident training in
+days, not weeks — 187× end-to-end and swarm-affordable sweeps; PufferLib was unnecessary once the
+env was native; and the cutile/cuda-oxide spike produced the predicted shape of answer — a real,
+parity-exact kernel that beats every baseline except the one that matters (the JAX env it would
+have replaced), so the pipeline stays on JAX with Rust/CUDA readiness banked.*
