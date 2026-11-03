@@ -352,3 +352,59 @@ numbers above at ≥3 batch widths + full-sweep wall-clock with schema-identical
 against the Track-A layout (`tests/test_jax_driver.py::test_engine_output_schema_parity`),
 deviations log = this file + `config.py` comments.  Open: weight-space PBT (D54), evosax
 multi-device (D55), B5 swarm usage during real retraining cycles.
+
+---
+
+# DECISIONS.md — Track C decision log (cutile / cuda-oxide spike)
+
+**Scope:** `SCALING_PLAN.md` Track C, C0–C4 (timeboxed spike; research-grade expectations).
+Full toolchain repro + compiler findings: `toolchain.md`. Kernel: `cutile_env.py`.
+Parity gate: `tests/test_cutile_env_parity.py` (5 tests, bit-exact traces).
+
+## C0. Toolchain verification — all three surfaces PASS
+
+| # | Decision | Rationale |
+|---|---|---|
+| D59 | **All three surfaces cleared C0 on this machine (sm_120, driver 590):** cuTile **Python** (`cuda-tile` 1.7.0 + tileiras 13.4.92 via pip `cuda-toolkit[tileiras,nvvm,nvcc]>=13.3`), **cutile-rs** 0.4.0 (`cargo add cutile`, pip toolkit as `CUDA_TOOLKIT_PATH`), **cuda-oxide** (`cargo oxide run vecadd` green under pinned Rust 1.99.1). Both formulations (T tile / S SIMT) are therefore available; the spike proceeded tile-only for the kernel (see D63 for why one kernel, not two). | Plan C0 go/no-go: "at least one runs → proceed". All three ran — the PTX/driver-580 trap did not reproduce on driver 590; the sm_120 Tile-IR floor is 13.2 (cutile-rs compatibility matrix), and `load_advanced_indexing` needs tileiras ≥ 13.3. Toolchain notes incl. the bindgen `stddef.h` workaround: `toolchain.md`. |
+| D60 | **Kernel scalars travel as f64/i32 buffers, not scalar parameters** (`scalar_arr [8]`, `int_arr [2]`, extracted in-kernel). | The kernel scalar ABI converts Python/`np.float64` scalars to **f32** regardless of type annotations — `10000.0*0.005` came out `49.99999888`, breaking the f64 money contract at the 1e-8 level. Buffers are exact. |
+| D61 | **Avoid `astype(int64)` on int tiles and i64 min-reduce; use `ct.gather` for dynamic row extracts.** The i64 one-hot min-reduce (exit-timestamp extraction) **silently miscompiled** — neighbouring SSA values were corrupted (entry prices recomputed from a different row's close). | Found by instrumented bisection (`toolchain.md` §5). The replaced construct (`ct.gather(ts_pad, (row, rel))`) is exact and simpler; the int32 min-reduces for first-touch indices are fine. Compiler-bug avoidance is the difference between bit-exact parity and silent corruption. |
+
+## C1. Kernel design (numerical contract first)
+
+| # | Decision | Rationale |
+|---|---|---|
+| D62 | **Formulation T only, ported expression-for-expression from `jax_env.step`**: SoA state arrays persisting across launches; per-lane select-style state machine; padded-window gather for the intrabar first-touch (LUT_SPEC §3.4 form) via one `load_advanced_indexing` row gather + per-row int32 min-reduce (`rel = min(where(mask, j, 99))`, SL-first tie rule); two trade-record slots per step (D46); obs = 25 market cols in `[N,32]` + 6 f32 pos vectors (concat at the seam). Scope cut per plan: no policy/PPO/normalisation in the kernel. TILE=64 envs/block, N a multiple of 64. | Plan C1. The reference (`jax_env.step`) is the already-verified port of `env_bracket` — porting its exact op order made the C4 parity test a clean bit-level gate (and caught a real formulation subtlety: obs position features use the **post-step** bar's close/atr while the MtM reward uses the **pre-step** bar's). Formulation S (cuda-oxide SIMT) left as follow-up once C2/C3 numbers existed (D63). |
+
+## C2/C3. Measurements + trainer-seam decision record
+
+**C2 raw kernel throughput** (`python cutile_env.py`, RTX 5070 Ti, f64 state, per-step launch):
+
+| Envs/step | cuTile kernel | JAX vmap env (B5, same shape) | numpy env (Track-A baseline) |
+|---|---|---|---|
+| 1,024 | **44.2 M steps/s** | 42.3 M | 14,886 |
+| 4,096 | **84.9 M steps/s** | 130.3 M | — |
+| 16,384 | **126.7 M steps/s** | 162.0 M | — |
+| 65,536 | **141.5 M steps/s** | 213.0 M | — |
+
+**C3 seam measurement** (identical 128-step rollout × 4,096 envs, env step only):
+
+| Path | steps/s | compile |
+|---|---|---|
+| cuTile kernel via `cuda.tile.jax.cutile_call` inside `lax.scan` | 77.7 M | 0.3 s |
+| `jax_env.step` vmapped inside `lax.scan` (Track-B rollout) | 160.4 M | 0.2 s |
+
+| # | Decision | Rationale |
+|---|---|---|
+| D63 | **Trainer-seam verdict: keep the JAX trainer end-to-end; do NOT route the env step through the kernel.** The C3 option-2 seam is *mechanically proven* (the kernel runs inside `jax.jit` through `cutile_call` with bit-exact outputs — `test_jax_ffi_seam_step`), but the env-step kernel is **~2× slower than XLA's vmapped `jax_env.step`** on this workload (raw kernel 141.5 M vs 213 M at 64k envs; in-graph 77.7 M vs 160.4 M at 4k). Effort estimate for the record: kernel + parity = the done work (~2 days); a cutile-rs port of the same formulation ≈ +2–3 days (Rust host harness, same tile semantics); Formulation S in cuda-oxide ≈ +3–5 days and would need to beat the tile form by >2× to matter — not justified while the env is not the bottleneck (B5: end-to-end training is update-bound at 494 k steps/s ≪ 200 M env-only). | Plan C3 asks for a written seam choice *with measured numbers*. The numbers say the seam buys nothing for throughput today: the branchy select-style step is exactly what XLA compiles well. The kernel wins ties at tiny batches and is the natural home for the **step-function LUT** (LUT_SPEC §3.1) if that ever replaces the padded scan — a gather+binary-search kernel is where a hand-written kernel plausibly beats generic lowering. |
+| D64 | **C4 verdict: archive the seam, adopt the kernel + toolchain as the Track-C artifact.** "JAX remains the GPU path" (the plan's archive option), but the spike's DoD *positive branch* is satisfied: kernel at **141.5 M steps/s ≈ 9,500× the numpy env** (gate: ≥10×) **and** the trainer seam is chosen in writing (D63). Parity: multi-step traces + trade records vs `jax_env.step` are **bit-exact on ints/bools/obs** and within **2e-13** (1-ulp, compiler association) on f64 — gate tolerance 1e-9 (D32 policy). Re-entry triggers: (a) step-function-LUT kernel, (b) a Burn/Rust trainer move (cutile-rs continuity — C0-validated), (c) intra-kernel policy/env fusion as a goal. | Plan C4: "adopt (with seam plan) / archive (JAX remains the GPU path…)". The honest hybrid: the surface is *proven* and the artifact is kept (kernel, parity suite, `toolchain.md`), while the integration is shelved with explicit re-entry conditions — exactly what a timeboxed research spike should produce. |
+
+## Track C status: COMPLETE (DoD met on the positive branch)
+
+| Item | Status | Evidence |
+|---|---|---|
+| C0 toolchain (3 surfaces) | PASS | `toolchain.md`; cutile-rs `vecadd` OK, cuda-oxide `vecadd` OK, cuTile-Python f64 vecadd OK — all on sm_120 / driver 590 |
+| C1 numerical contract + kernel | done | `cutile_env.py` (Formulation T, contract in docstring) |
+| C2 raw measurement | done | 44.2–141.5 M steps/s (1k–64k envs) — ≈10⁴× the numpy env |
+| C3 seam decision record | done | D63 above with numbers + effort estimates |
+| C4 parity + writeup | done | 5-test gate (bit-exact traces, two-slot trade records incl. D46 coverage, FFI seam proof); `toolchain.md` §5 lessons-per-surfaces note; verdict D64 |
+| Formulation S (cuda-oxide SIMT) | not implemented | C0-validated and ready; deferred per D63 (needs >2× win to matter, env is not the bottleneck) |

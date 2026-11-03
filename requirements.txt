@@ -26,3 +26,11 @@ jax-cuda13-plugin==0.12.0.1
 jax-cuda13-pjrt==0.12.0.1
 optax==0.2.8
 evosax==0.3.2        # B5 swarm level 3 (population hp sweeps)
+
+# Track C (spike, optional — DECISIONS.md D59-D64). The kernel tests skip when
+# these are absent.  Note: torch pins cuda-toolkit==13.2.2 and pip will warn
+# about the 13.4.3 bump below (verified benign: torch/jax CUDA both fine);
+# tileiras must be >=13.3 for the kernel's gather op (toolchain.md).
+# cuda-tile==1.7.0
+# cupy-cuda13x==14.2.0
+# cuda-toolkit[tileiras,nvvm,nvcc]==13.4.3
