@@ -9,6 +9,7 @@ __pycache__/
 
 # Run artifacts
 models/
+models_*/
 outputs/
 
 # Tooling

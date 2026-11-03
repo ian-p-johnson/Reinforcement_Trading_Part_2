@@ -626,27 +626,26 @@ def rollout_on_split(handle: JaxModel, m1: pd.DataFrame, feature_cols: list[str]
         "reward": np.asarray(out["reward"], dtype=np.float64),
     }, index=idx)
 
-    tz = decision_df.index.tz
     rows = []
-    closed = np.asarray(out["closed"])
-    for t in range(closed.shape[1]):
+    closed = np.asarray(out["closed"])          # [steps, 2] — time-major scan out
+    for t in range(closed.shape[0]):
         for slot in (0, 1):
-            if bool(closed[slot, t]):
+            if bool(closed[t, slot]):
                 rows.append({
-                    "entry_time": jax_env.stamps_from_ts([int(out["entry_ts"][slot, t])], decision_df.index)[0],
-                    "exit_time": jax_env.stamps_from_ts([int(out["exit_ts"][slot, t])], decision_df.index)[0],
-                    "direction": int(out["trade_direction"][slot, t]),
-                    "entry_price": float(out["entry_price"][slot, t]),
-                    "exit_price": float(out["exit_price"][slot, t]),
-                    "sl": float(out["sl"][slot, t]),
-                    "tp": float(out["tp"][slot, t]),
-                    "sl_atr_mult": float(out["sl_atr_mult"][slot, t]),
-                    "tp_r_bracket": float(out["tp_r"][slot, t]),
-                    "units": float(out["units"][slot, t]),
-                    "pnl": float(out["pnl"][slot, t]),
-                    "r_mult": float(out["r_mult"][slot, t]),
-                    "bars_in_trade": int(out["bars_in_trade"][slot, t]),
-                    "exit_reason": jax_env.REASON_STRINGS[int(out["reason"][slot, t])],
+                    "entry_time": jax_env.stamps_from_ts([int(out["entry_ts"][t, slot])], decision_df.index)[0],
+                    "exit_time": jax_env.stamps_from_ts([int(out["exit_ts"][t, slot])], decision_df.index)[0],
+                    "direction": int(out["trade_direction"][t, slot]),
+                    "entry_price": float(out["entry_price"][t, slot]),
+                    "exit_price": float(out["exit_price"][t, slot]),
+                    "sl": float(out["sl"][t, slot]),
+                    "tp": float(out["tp"][t, slot]),
+                    "sl_atr_mult": float(out["sl_atr_mult"][t, slot]),
+                    "tp_r_bracket": float(out["tp_r"][t, slot]),
+                    "units": float(out["units"][t, slot]),
+                    "pnl": float(out["pnl"][t, slot]),
+                    "r_mult": float(out["r_mult"][t, slot]),
+                    "bars_in_trade": int(out["bars_in_trade"][t, slot]),
+                    "exit_reason": jax_env.REASON_STRINGS[int(out["reason"][t, slot])],
                 })
     trades = pd.DataFrame(rows, columns=[
         "entry_time", "exit_time", "direction", "entry_price", "exit_price",

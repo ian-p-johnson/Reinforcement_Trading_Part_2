@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import conftest  # noqa: F401
@@ -137,3 +138,62 @@ def test_benchmark_harness_wires():
     groups = {g for g, _n, _d in jb.RESULTS}
     assert groups == {"env", "train", "comp", "xfer", "vram"}, groups
     assert all(detail for _g, _n, detail in jb.RESULTS)
+
+
+# ── rollout_on_split trade reconstruction (regression) ──────────────────────
+
+
+def test_rollout_on_split_reconstructs_trades():
+    """Regression: the eval scan stacks per-step info as [steps, 2-slots] —
+    a transposed read silently dropped trade records (sweep showed equity
+    moving with n_trades=0).  Forces a policy that always trades and compares
+    ``rollout_on_split`` against an independent step-loop replay."""
+    from test_jax_env_parity import REASON_STR, TRADE_COLUMNS, _trade_rows
+    from scenarios import build_frame, make_m1
+
+    m1 = make_m1(n_days=30, seed=7)
+    feat, cols = build_frame(m1)
+    df = feat   # ~471 bars: the long_tight_reentry scenario churns trades here
+    params = _window_params(m1, cols, df)
+
+    handle = jax_ppo.JaxModel(
+        params=jax_ppo.init_params(jax.random.PRNGKey(3), len(cols) + 6),
+        norm=jax_ppo.init_norm_state(len(cols) + 6))
+    # Bias the head so deterministic actions are always [long, sl0, tp0]
+    # (direction logits: 0=flat, 1=long, 2=short).
+    b = np.zeros(10, dtype=np.float32)
+    b[1], b[3], b[6] = 10.0, 10.0, 10.0
+    handle = jax_ppo.JaxModel(
+        params={**handle.params,
+                "pi": {**handle.params["pi"],
+                       "head": {**handle.params["pi"]["head"],
+                                "b": jnp.asarray(b)}}},
+        norm=handle.norm)
+
+    eq, trades, rep = jax_ppo.rollout_on_split(handle, m1, cols, df)
+    assert len(trades) > 0, "forced-long policy must trade on this window"
+    assert list(trades.columns) == TRADE_COLUMNS
+
+    # Independent replay with the same deterministic policy.
+    state = jax_env.init_state(params, 0)
+    infos = []
+    for _ in range(params.close.shape[0] - 2):
+        obs = jax_env.observation(state, params)[None, :]
+        action = jax_ppo.deterministic_actions(
+            jax_ppo.policy_logits(handle.params, jax_ppo.normalize_obs(obs, handle.norm)))[0]
+        _o, state, _r, term, trunc, info = jax_env.step(state, action, params)
+        infos.append(info)
+        if term or trunc:
+            break
+    ref = pd.DataFrame(_trade_rows(infos, df.index), columns=TRADE_COLUMNS)
+    assert len(ref) == len(trades)
+    for col in TRADE_COLUMNS:
+        a, b_ = ref[col].to_numpy(), trades[col].to_numpy()
+        if np.issubdtype(a.dtype, np.floating):
+            np.testing.assert_allclose(a, b_, rtol=0, atol=1e-9, err_msg=col)
+        else:
+            np.testing.assert_array_equal(a.astype(str), b_.astype(str), err_msg=col)
+    # Equity change must equal the sum of trade PnLs (sanity of the chain).
+    np.testing.assert_allclose(eq["equity"].iloc[-1] - 10_000.0, trades["pnl"].sum(),
+                               rtol=1e-9, atol=1e-9)
+    assert rep["n_trades"] == len(trades)

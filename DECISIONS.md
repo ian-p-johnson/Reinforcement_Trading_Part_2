@@ -310,3 +310,45 @@ out_dirs: sequential JAX driver, parallel JAX driver (2 workers), and SB3↔JAX 
 trainers — D48). Loader branches exercised via the shared `_rollout_on_split` tail.
 
 | D57 | **Eval-path `PPO.load(...)` calls go to CPU** (`_load_fold_model`, `final_holdout_eval._run_rl_holdout`, `training_diagnostics`), training device selection is unchanged. | SB3's `PPO.load` defaults to auto-device (CUDA if present). In shared-process runs JAX holds VRAM and torch's cuBLAS fails to initialise (`CUBLAS_STATUS_NOT_INITIALIZED`, seen in the combined suite). Single-env deterministic evals gain nothing from the GPU anyway (ANALYSIS §4.3: per-step transfer cost dominates). |
+
+## B5 — recorded measurements (quiet machine, 2026-11-02)
+
+| # | Decision | Rationale |
+|---|---|---|
+| D58 | **`rollout_on_split` trade reconstruction indexed the eval scan as `[slot, time]` instead of `[time, slot]`** — found by the production sweep (equity moved with `n_trades=0`), fixed, and pinned by `test_rollout_on_split_reconstructs_trades` (forced-long policy, exact match vs independent replay + equity = initial + Σ pnl). | The B4 tests validated a driver-style replay loop, not this function's own reconstruction — the gap is now closed. First sweep's trade-dependent metrics (PF/win-rate/n_trades) were void; the sweep was re-run clean (below). |
+
+### Throughput (RTX 5070 Ti Laptop, sm_120; `python jax_benchmarks.py all --data real`)
+
+| Measurement | Result | Reference |
+|---|---|---|
+| env-only vmap step @ 1,024 envs | **42.3 M steps/s** | SB3 measured 1,650–2,649 env-steps/s (ANALYSIS §3) |
+| env-only vmap step @ 4,096 envs | **130.3 M steps/s** | |
+| env-only vmap step @ 16,384 envs | **162.0 M steps/s** | |
+| env-only vmap step @ 65,536 envs | **213.0 M steps/s** | plan's 10⁶–10⁷ class exceeded by ~10–100× |
+| end-to-end train @ 64×256 (16,384 buffer) | **494,236 steps/s** | ≈ 187× the best SB3 end-to-end rate |
+| compile (rollout / gae / update) @ 64×256 | 0.96 s / 0.07 s / 0.87 s | per shape; ~2–5 s at the SB3-parity 4×2048 shape |
+| trajectory volume per rollout | **2.44 MB** (host pull < 0.05 ms) | plan expected ~MB ✓ |
+| VRAM residency (rollout+update) | **52 MB in use, 189 MB peak** | of 12 GB — swarm width is the remaining headroom |
+
+### Full sliding sweep wall-clock (B5/DoD target)
+
+| Run | Wall-clock | Notes |
+|---|---|---|
+| **JAX engine, 34 folds × 3 M steps** (4 parallel workers, `models_jax_prod/`) | **674 s (11.2 min)** | ≈ 102 M train env-steps + 20 consistency evals/fold + val/test rollouts + per-fold compiles; effective ≈ 151 k steps/s sweep-wide incl. all overhead |
+| SB3 reference | ~2.8–3.5 h extrapolated (34 × 3 M at 1,886–2,649 steps/s, 4-fold parallelism) | ANALYSIS §3 rates; Track A never ran the full production SB3 sweep |
+| Seed sweep (5 seeds × 100 k steps, `swarm.py seeds`) | **75 s** | |
+
+Plan B5's target was "full 34-fold × 3 M-step sweep in minutes-to-tens-of-minutes" — **met at 11.2 min**.
+
+### Sweep result (clean run) + seed variance — the swarm payoff
+
+* Stitched OOS (34 test windows, compounded): **+240.5%**, Sharpe-like **+0.63**, max DD **−36.5%**, PF **1.07** over 9,445 trades; 20/34 folds positive with PF>1.
+* **Consistency gate FAILED** (worst-fold PF 0.77 < 0.90) — correctly quarantined (`NO_DEPLOY`), model kept. The gate did its job on the JAX engine's first production run.
+* Seed variance at 100 k steps (val): return **−10.8% ± 12.2%**, Sharpe **−0.35 ± 0.46** across 5 seeds — quantitative confirmation of ANALYSIS §7's single-seed-42 concern; L1 sweeps are now affordable (75 s).
+
+**Track B status:** B0–B5 complete. DoD items: parity harness green (B2 evidence), existing
+gate/summary/holdout scripts consume JAX artifacts via loader branches (B4 tests), recorded
+numbers above at ≥3 batch widths + full-sweep wall-clock with schema-identical outputs diffed
+against the Track-A layout (`tests/test_jax_driver.py::test_engine_output_schema_parity`),
+deviations log = this file + `config.py` comments.  Open: weight-space PBT (D54), evosax
+multi-device (D55), B5 swarm usage during real retraining cycles.
